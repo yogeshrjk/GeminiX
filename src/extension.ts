@@ -31,6 +31,7 @@ const VIEW_ID = "liveline.chatView";
 interface WebviewMessage {
   readonly type: string;
   readonly value?: string;
+  readonly url?: string;
   readonly muted?: boolean;
   readonly requestId?: string;
   readonly actionId?: string;
@@ -46,6 +47,7 @@ interface WebviewMessage {
   readonly functionResponse?: unknown;
   readonly enabled?: boolean;
   readonly data?: string;
+  readonly startLine?: number;
   readonly fromEdit?: boolean;
 }
 
@@ -94,6 +96,45 @@ class GeminiXViewProvider
   private screenShareTimer: NodeJS.Timeout | undefined;
   private lastScreenFrameKey = "";
   private sessionHistorySeeded = false;
+
+  private async openFile(
+    filePath: string | undefined,
+    startLine?: number,
+  ): Promise<void> {
+    if (!filePath) {
+      return;
+    }
+    try {
+      const file = await this.workspaceContextRetriever.readFile(filePath);
+      const doc = await vscode.workspace.openTextDocument(file.uri);
+      const targetLine = Math.min(
+        Math.max(1, Math.floor(startLine ?? 1)),
+        doc.lineCount,
+      );
+      await vscode.window.showTextDocument(doc, {
+        preview: true,
+        selection: new vscode.Range(
+          targetLine - 1,
+          0,
+          targetLine - 1,
+          0,
+        ),
+      });
+    } catch {
+      vscode.window.showErrorMessage(`Could not open file: ${filePath}`);
+    }
+  }
+
+  private openExternal(url: string | undefined): void {
+    if (!url) {
+      return;
+    }
+    try {
+      void vscode.env.openExternal(vscode.Uri.parse(url));
+    } catch {
+      vscode.window.showErrorMessage(`Could not open URL: ${url}`);
+    }
+  }
 
   public constructor(
     private readonly extensionUri: vscode.Uri,
@@ -269,6 +310,12 @@ class GeminiXViewProvider
         case "refreshExtension":
           this.refreshExtension();
           break;
+        case "openFile":
+          await this.openFile(message.data, message.startLine);
+          break;
+        case "openExternal":
+          this.openExternal(message.url);
+          break;
       }
     } catch (error) {
       this.post({
@@ -337,34 +384,39 @@ class GeminiXViewProvider
       this.handleSessionEvent(event);
     });
 
-    this.microphone = new MicrophoneCapture({
-      onFrame: (frame) => {
-        if (!this.micMuted) {
-          this.session?.sendPcm16(frame);
-        }
-      },
-      onLevel: (level) => {
-        this.post({ type: "microphoneLevel", level });
-      },
-      onSpeechStart: () => {
-        void this.sendVoiceContext();
-      },
-      onError: (message) => {
-        this.post({ type: "sessionError", message });
-        this.stopSession();
-      },
-    });
-
     try {
+      this.microphone = new MicrophoneCapture({
+        onFrame: (frame) => {
+          if (!this.micMuted) {
+            this.session?.sendPcm16(frame);
+          }
+        },
+        onLevel: (level) => {
+          this.post({ type: "microphoneLevel", level });
+        },
+        onSpeechStart: () => {
+          void this.sendVoiceContext();
+        },
+        onError: (message) => {
+          this.post({ type: "sessionError", message });
+          this.stopSession();
+        },
+      });
       this.microphone.start();
       this.session.connect(apiKey, readPreferences());
     } catch (error) {
       this.disposeLiveResources();
-      throw new Error(
-        error instanceof Error
-          ? `Could not open the default microphone: ${error.message}`
-          : "Could not open the default microphone.",
-      );
+      // Report through the normal session-error path instead of throwing:
+      // a hostError would leave the webview stuck on "Requesting
+      // microphone" with a disabled Start button (isConnecting stays true)
+      // until the extension or window is reloaded.
+      this.post({
+        type: "sessionError",
+        message:
+          error instanceof Error
+            ? `Could not open the default microphone: ${error.message}`
+            : "Could not open the default microphone.",
+      });
     }
   }
 
@@ -543,7 +595,7 @@ class GeminiXViewProvider
     );
     const session = this.session;
     if (
-      !(await session.sendUserTurn(prompt, preparedAttachments.images)) ||
+      !session.sendUserTurn(prompt, preparedAttachments.images) ||
       session !== this.session
     ) {
       this.post({
@@ -1842,7 +1894,7 @@ async function lookupPackage(
       `https://registry.npmjs.org/${encodeURIComponent(normalized)}`,
     );
     const data: unknown = JSON.parse(body);
-    const latest = (data as { "dist-tags"?: { latest?: unknown } })?.[
+    const latest = (data as { "dist-tags"?: { latest?: unknown } })[
       "dist-tags"
     ]?.latest;
     if (typeof latest === "string") {

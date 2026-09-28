@@ -491,7 +491,8 @@ button:disabled {
 }
 
 .message-context {
-  display: block;
+  display: flex;
+  align-items: center;
   max-width: 100%;
   margin-bottom: 5px;
   overflow: hidden;
@@ -502,9 +503,19 @@ button:disabled {
   white-space: nowrap;
 }
 
+.message-context a:hover {
+  text-decoration: underline;
+}
+
 .message-context::before {
+  display: none;
+}
+
+.context-icon {
+  display: flex;
+  align-items: center;
+  margin-right: 4px;
   color: var(--accent);
-  content: attr(data-marker) " ";
 }
 
 .message-content {
@@ -520,6 +531,31 @@ button:disabled {
 
 .message.model .message-content {
   white-space: normal;
+}
+
+/* File references and external URLs from the model's answer. */
+.message-content a.file-link,
+.message-content a.external-link {
+  color: var(--vscode-textLink-foreground, var(--accent));
+  cursor: pointer;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.message-content a.file-link:hover,
+.message-content a.external-link:hover {
+  text-decoration: underline;
+}
+
+.message-content a.file-link {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11.5px;
+}
+
+.message-content a.external-link::after {
+  content: " ↗";
+  font-size: 0.85em;
+  opacity: 0.65;
 }
 
 /* User question editing (fix mis-heard speech transcriptions). */

@@ -2,7 +2,7 @@
   "name": "gemini-x",
   "displayName": "GeminiX",
   "description": "Explore and explain selected code with Gemini Live inside VS Code.",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "icon": "media/gemini-x.png",
   "publisher": "YogeshRajak",
   "license": "MIT",
@@ -44,7 +44,7 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "check": "tsc --noEmit && eslint .",
-    "package": "npm run check && npm run build && vsce package --out gemini-x-v0.6.4.vsix",
+    "package": "npm run check && npm run build && vsce package --out gemini-x-v0.6.5.vsix",
     "test": "node --import tsx --test tests/*.test.ts",
     "vscode:prepublish": "npm run build"
   },

@@ -11,7 +11,7 @@
 <p align="center">
   <img alt="VS Code" src="https://img.shields.io/badge/VS_Code-^1.96.0-007ACC?logo=visualstudiocode" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green" />
-  <img alt="Version" src="https://img.shields.io/badge/version-0.6.4-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-0.6.5-blue" />
   <img alt="Gemini" src="https://img.shields.io/badge/Gemini-3.1_Flash_Live-8E75B2" />
 </p>
 
@@ -103,12 +103,12 @@ npm install
 npx @vscode/vsce package
 ```
 
-This generates a `.vsix` file (for example, `gemini-x-v0.6.4.vsix`) in the project root, which can then be installed using **Extensions: Install from VSIX...**.
+This generates a `.vsix` file (for example, `gemini-x-v0.6.5.vsix`) in the project root, which can then be installed using **Extensions: Install from VSIX...**.
 
 1. Open VS Code.
 2. Press `Cmd+Shift+P` (macOS) or `Ctrl+Shift+P` (Windows/Linux) to open the Command Palette.
 3. Run **Extensions: Install from VSIX…**.
-4. Select `gemini-x-v0.6.4.vsix`.
+4. Select `gemini-x-v0.6.5.vsix`.
 5. Open **GeminiX** from the Activity Bar (the GeminiX icon).
 6. Click the gear button (⚙️) in GeminiX and save your **Gemini API key** from [Google AI Studio](https://aistudio.google.com/).
 
@@ -226,16 +226,18 @@ npm run package
 ### Technical Architecture
 
 | Component          | Details                                                                                                                                   |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- | --- | ---------------- | ------------------------------------------------------------------------------ |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | **AI Model**       | `gemini-3.1-flash-live-preview` via the Gemini Live API (WebSocket).                                                                      |
 | **Voice Input**    | Raw PCM16 audio at 16 kHz, captured via `@picovoice/pvrecorder-node` in the extension host.                                               |
 | **Audio Playback** | PCM16 audio at 24 kHz, rendered in the webview via the Web Audio API.                                                                     |
 | **Microphone**     | Runs in the VS Code extension host (webviews don't have direct mic access). Cross-platform binaries included in the VSIX.                 |
 | **Indexing**       | In-memory lexical and filename index over workspace source files (up to 1,500 files, 384 KB each). Kept current by a `FileSystemWatcher`. |
 | **Text Input**     | Real-time text via Live API `realtimeInput`.                                                                                              |
-| **Image Input**    | Live API video-frame input for attached images (JPEG, PNG, WebP).                                                                         |     | **Screen Share** | Active editor rendered to a canvas and streamed as Live video frames (≈1 FPS). |
+| **Image Input**    | Live API video-frame input for attached images (JPEG, PNG, WebP).                                                                         |
+| **Screen Share**   | Active editor rendered to a canvas and streamed as Live video frames (≈1 FPS).                                                            |
 | **Web Search**     | `search_web` tool backed by Wikipedia, Stack Overflow, MDN, Hacker News, GitHub, and package registries.                                  |
-| **URL Analysis**   | `fetch_url` tool that fetches pages (and GitHub READMEs) and converts them to markdown.                                                   |     | **Rendering**    | Shiki syntax highlighting with VS Code's `light-plus` and `dark-plus` themes.  |
+| **URL Analysis**   | `fetch_url` tool that fetches pages (and GitHub READMEs) and converts them to markdown.                                                   |
+| **Rendering**      | Shiki syntax highlighting with VS Code's `light-plus` and `dark-plus` themes.                                                             |
 | **History**        | Local JSON files in VS Code's `globalStorage`.                                                                                            |
 
 ---

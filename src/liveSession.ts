@@ -163,10 +163,10 @@ export class LiveSession {
     return this.send({ realtimeInput: {} });
   }
 
-  public async sendUserTurn(
+  public sendUserTurn(
     text: string,
     images: readonly ImageContext[] = []
-  ): Promise<boolean> {
+  ): boolean {
     if (!images.length) {
       return this.send({ realtimeInput: { text } });
     }

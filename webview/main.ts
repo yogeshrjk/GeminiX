@@ -867,13 +867,37 @@ function stopTimer(): void {
 function createContextBadge(
   label: string,
   title: string,
-  marker = "</>"
+  marker = "</>",
+  filePath?: string,
+  iconName: LucideIconName = "file-text"
 ): HTMLElement {
   const badge = document.createElement("div");
   badge.className = "message-context";
-  badge.textContent = label;
   badge.dataset["marker"] = marker;
   badge.title = title;
+
+  const icon = document.createElement("span");
+  icon.className = "context-icon";
+  icon.innerHTML = lucideIconSvg(iconName, 12);
+  badge.append(icon);
+
+  if (filePath) {
+    const link = document.createElement("a");
+    link.href = "#";
+    link.textContent = label;
+    link.style.color = "inherit";
+    link.style.textDecoration = "none";
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      vscode.postMessage({ type: "openFile", data: filePath });
+    });
+    badge.append(link);
+  } else {
+    const text = document.createElement("span");
+    text.textContent = label;
+    badge.append(text);
+  }
+
   return badge;
 }
 
@@ -894,7 +918,7 @@ function createMessage(
     storedMessage?.currentPageLabel ?? currentPage?.relativePath;
   if (contextLabel) {
     body.append(
-      createContextBadge(contextLabel, "Selected editor context")
+      createContextBadge(contextLabel, "Selected editor context", "</>", context?.fileName)
     );
   }
   if (currentPageLabel) {
@@ -902,7 +926,9 @@ function createMessage(
       createContextBadge(
         currentPageLabel,
         "Attached current file",
-        "@"
+        "@",
+        currentPage?.relativePath,
+        "file-text"
       )
     );
   }
@@ -1384,22 +1410,183 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function renderInlineMarkdown(text: string): string {
-  const codeSpans: string[] = [];
-  const protectedText = text.replace(/`([^`\n]+)`/gu, (_, code: string) => {
-    const token = `\uE000CODE${codeSpans.length}\uE001`;
-    codeSpans.push(
-      `<code>${escapeHtml(unescapeMarkdownPipes(code))}</code>`
+// File extensions the model commonly cites in answers. A token ending with one
+// of these (e.g. `src/main.ts`) is treated as a clickable file reference.
+const FILE_EXTENSIONS_SOURCE =
+  "ts|tsx|mts|cts|js|jsx|mjs|cjs|py|pyw|json|jsonc|jsonl|md|markdown|" +
+  "css|scss|sass|less|html|htm|vue|svelte|astro|go|rs|java|kt|kts|" +
+  "cpp|c|cc|cxx|h|hpp|hh|cs|php|swift|sh|bash|zsh|fish|yml|yaml|toml|ini|" +
+  "cfg|conf|sql|graphql|gql|ipynb|txt|xml|svg|dart|lua|jl|hs|fs|fsx|nim|" +
+  "nix|proto|prisma|tf|env|lock|gradle|pl|r|ex|exs|mdx|qmd|bat";
+
+const FILE_EXTENSION_PATTERN = new RegExp(
+  `\\.(${FILE_EXTENSIONS_SOURCE})$`,
+  "iu"
+);
+
+// Well-known files without a "regular" extension that the model may cite.
+const SPECIAL_FILE_NAMES = new Set([
+  "dockerfile",
+  "makefile",
+  "readme",
+  "changelog",
+  ".gitignore",
+  ".env",
+  ".npmrc",
+  ".babelrc",
+  ".eslintrc"
+]);
+
+const INLINE_CODE_PATTERN = /`([^`\n]+)`/gu;
+const MARKDOWN_LINK_PATTERN = /\[([^[\]]+)\]\(([^()\s]+)\)/gu;
+const BARE_URL_PATTERN = /(^|[\s([{'"<>;*_~])https?:\/\/[^\s<)"'`]+/giu;
+
+// A workspace-relative path token (optional `:line` / `:line:col` suffix).
+const FILE_TOKEN_PATTERN = new RegExp(
+  String.raw`^([A-Za-z0-9_.@~-]+(?:/[A-Za-z0-9_.@~-]+)*)(?::(\d+)(?::(\d+))?)?$`,
+  "iu"
+);
+
+// Detects a file reference inside a block of prose. Leading/trailing
+// boundaries keep us from splitting longer tokens (URLs, code, semver...).
+const FILE_REFERENCE_PATTERN = new RegExp(
+  String.raw`(^|[^A-Za-z0-9_@~/. -])` +
+    String.raw`((?:[A-Za-z0-9_.@~-]+/)*[A-Za-z0-9_.@~-]+)` +
+    String.raw`(?::(\d+)(?::(\d+))?)?` +
+    String.raw`(?=$|[^A-Za-z0-9_@~/-])`,
+  "giu"
+);
+
+interface FileReference {
+  readonly path: string;
+  readonly display: string;
+  readonly line?: number;
+}
+
+function matchFileReference(value: string): FileReference | undefined {
+  const match = FILE_TOKEN_PATTERN.exec(value.trim());
+  if (!match) {
+    return undefined;
+  }
+  const rawPath = match[1] ?? "";
+  const path = rawPath.replace(/\.+$/u, "");
+  if (!path) {
+    return undefined;
+  }
+  const line = match[2] ? Number(match[2]) : undefined;
+  const basename = path.slice(path.lastIndexOf("/") + 1);
+  if (
+    !SPECIAL_FILE_NAMES.has(basename.toLowerCase()) &&
+    !FILE_EXTENSION_PATTERN.test(basename)
+  ) {
+    return undefined;
+  }
+  return {
+    path,
+    display: line === undefined ? path : `${path}:${line}`,
+    line
+  };
+}
+
+function buildFileLinkHtml(
+  path: string,
+  label: string,
+  line?: number
+): string {
+  const lineAttribute = line === undefined ? "" : ` data-line="${line}"`;
+  return `<a href="#" class="file-link" data-path="${escapeHtml(path)}"${lineAttribute} title="${escapeHtml(path)}">${escapeHtml(label)}</a>`;
+}
+
+function buildExternalLinkHtml(url: string, label: string): string {
+  return `<a href="${escapeHtml(url)}" class="external-link" target="_blank" rel="noreferrer" title="${escapeHtml(url)}">${escapeHtml(label)}</a>`;
+}
+
+function buildMarkdownLinkHtml(label: string, url: string): string {
+  const cleanLabel = label.replace(/^`+|`+$/gu, "").trim();
+  if (/^(?:https?:|mailto:|tel:)/iu.test(url)) {
+    // Always show the full URL as the visible text so links are transparent.
+    return buildExternalLinkHtml(url, url);
+  }
+  if (/^vscode-file:/iu.test(url)) {
+    return buildFileLinkHtml(
+      url.replace(/^vscode-file:(?:\/\/)?[^/]*\/?/iu, ""),
+      cleanLabel
     );
+  }
+  return buildFileLinkHtml(url.replace(/^\.\//u, ""), cleanLabel);
+}
+
+function renderInlineMarkdown(text: string): string {
+  const replacements: string[] = [];
+
+  const protect = (html: string): string => {
+    const token = `\uE000${replacements.length}\uE001`;
+    replacements.push(html);
     return token;
+  };
+
+  const restore = (html: string): string =>
+    html.replace(
+      /\uE000(\d+)\uE001/gu,
+      (_, index: string) => replacements[Number(index)] ?? ""
+    );
+
+  let processed = text;
+
+  // 1) Markdown links, [label](https://…), [label](src/main.ts), ...
+  processed = processed.replace(
+    MARKDOWN_LINK_PATTERN,
+    (_, label: string, url: string) =>
+      protect(buildMarkdownLinkHtml(label.trim(), url.trim()))
+  );
+
+  // 2) Bare http(s) URLs – render as clickable links.
+  processed = processed.replace(
+    BARE_URL_PATTERN,
+    (match: string, prefix: string) => {
+      const url = match.slice(prefix.length).replace(/[.,;:!?<>]+$/u, "");
+      if (!url) {
+        return match;
+      }
+      return prefix + protect(buildExternalLinkHtml(url, url));
+    }
+  );
+
+  // 3) Inline code spans – file references become links, everything else
+  //    stays inline code.
+  processed = processed.replace(INLINE_CODE_PATTERN, (_, code: string) => {
+    const codeText = unescapeMarkdownPipes(code);
+    const reference = matchFileReference(codeText);
+    if (reference) {
+      return protect(
+        buildFileLinkHtml(reference.path, reference.display, reference.line)
+      );
+    }
+    return protect(`<code>${escapeHtml(codeText)}</code>`);
   });
 
-  let html = escapeHtml(unescapeMarkdownPipes(protectedText));
-  html = html.replace(/\*\*([^*]+)\*\*/gu, "<strong>$1</strong>");
-  return html.replace(
-    /\uE000CODE(\d+)\uE001/gu,
-    (_, index: string) => codeSpans[Number(index)] ?? ""
+  // 4) File references in plain prose (main.ts, src/util/format.ts:12, ...).
+  processed = processed.replace(
+    FILE_REFERENCE_PATTERN,
+    (match: string, prefix: string, token: string, line?: string) => {
+      const reference = matchFileReference(token);
+      if (!reference) {
+        return match;
+      }
+      const lineNumber = line === undefined ? undefined : Number(line);
+      return `${prefix}${protect(
+        buildFileLinkHtml(
+          reference.path,
+          lineNumber === undefined ? reference.path : `${reference.path}:${lineNumber}`,
+          lineNumber
+        )
+      )}`;
+    }
   );
+
+  let html = escapeHtml(unescapeMarkdownPipes(processed));
+  html = html.replace(/\*\*([^*]+)\*\*/gu, "<strong>$1</strong>");
+  return restore(html);
 }
 
 function renderMarkdownBlock(container: HTMLElement, text: string): void {
@@ -2739,41 +2926,28 @@ function handleHostMessage(message: HostMessage): void {
       if (message.intentional) {
         setStatus("Disconnected");
       } else {
-        // Gemini sends a GoAway message before ending the connection (for
-        // example at its connection time limit). LiveSession now closes the
-        // socket with a GoAway reason, so that expected close can be told
-        // apart from a genuine policy violation (code 1008).
+        // A live connection was lost (e.g. "Gemini Live connection closed
+        // (code 1006)" or a policy violation with code 1008). Stop the
+        // session here and hand control back to the user: never auto-retry,
+        // because a failing connection would otherwise loop forever,
+        // re-requesting the microphone every 1.5s and leaving the UI stuck
+        // on "Requesting microphone". The user clicks "Start live session"
+        // again once the underlying problem is resolved.
+        pushDebugLog(
+          `Session closed: code=${message.code ?? "unknown"}, reason=${message.reason ?? "none"}, intentional=${Boolean(message.intentional)}`
+        );
         const isGoAway =
           /goaway|failed to close the connection/i.test(
             message.reason ?? ""
           );
         const detail = isGoAway
-          ? "Gemini closed the live session after its connection time limit. Starting a new session…"
+          ? "Gemini closed the live session after its connection time limit. Click “Start live session” to reconnect."
           : message.reason ||
             (message.code === 1008
-              ? `Gemini Live rejected the connection (code ${message.code}). Verify the API key, selected model, Live API support, and session configuration.`
-              : `Gemini Live connection closed (code ${message.code ?? "unknown"}).`);
-        pushDebugLog(
-          `Session closed: code=${message.code ?? "unknown"}, reason=${message.reason ?? "none"}, intentional=${Boolean(message.intentional)}`
-        );
-        if (state.apiConfigured) {
-          setStatus(
-            isGoAway ? "Reconnecting…" : "Retrying connection...",
-            "busy"
-          );
-          window.setTimeout(() => {
-            if (!state.sessionReady && !state.isConnecting) {
-              void beginSession();
-            }
-          }, 1500);
-        }
-        if (isGoAway) {
-          // Expected time-limit close: restart seamlessly, no error flash.
-          setStatus("Reconnecting…", "busy");
-        } else {
-          showError(detail);
-          setStatus("Disconnected", "error");
-        }
+              ? `Gemini Live rejected the connection (code ${message.code}). Verify the API key, selected model, Live API support, and session configuration. Please restart the live session.`
+              : `Gemini Live connection closed (code ${message.code ?? "unknown"}). Please restart the live session.`);
+        showError(detail);
+        setStatus("Disconnected", isGoAway ? "idle" : "error");
       }
       break;
     case "sessionStopped":
@@ -3299,6 +3473,42 @@ elements.textInput.addEventListener("keydown", (event) => {
 
 document.addEventListener("click", (event) => {
   const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    if (
+      target instanceof Node &&
+      !elements.attachmentMenu.contains(target) &&
+      !elements.attachmentButton.contains(target)
+    ) {
+      setAttachmentMenu(false);
+    }
+    return;
+  }
+
+  const externalLink = target.closest<HTMLElement>("a.external-link");
+  if (externalLink) {
+    event.preventDefault();
+    const url = externalLink.getAttribute("href");
+    if (url) {
+      vscode.postMessage({ type: "openExternal", url });
+    }
+    return;
+  }
+
+  const fileLink = target.closest<HTMLElement>("a.file-link");
+  if (fileLink) {
+    event.preventDefault();
+    const path = fileLink.dataset.path;
+    const startLine = fileLink.dataset.line;
+    if (path) {
+      vscode.postMessage({
+        type: "openFile",
+        data: path,
+        startLine: startLine ? Number(startLine) : undefined
+      });
+    }
+    return;
+  }
+
   if (
     target instanceof Node &&
     !elements.attachmentMenu.contains(target) &&

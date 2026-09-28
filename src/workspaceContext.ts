@@ -149,6 +149,7 @@ interface SymbolRange {
 }
 
 export interface WorkspaceFileRead {
+  readonly uri: vscode.Uri;
   readonly filePath: string;
   readonly languageId: string;
   readonly startLine: number;
@@ -353,6 +354,7 @@ export class WorkspaceContextRetriever implements vscode.Disposable {
     const text = completeRangeText.slice(0, MAX_TOOL_FILE_CHARACTERS);
 
     return {
+      uri: selectedFile.uri,
       filePath: selectedFile.relativePath,
       languageId: document.languageId,
       startLine,

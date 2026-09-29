@@ -19,6 +19,7 @@ import { __iconNode as sendNode } from "lucide-react/dist/esm/icons/send.mjs";
 import { __iconNode as refreshCwNode } from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import { __iconNode as copyNode } from "lucide-react/dist/esm/icons/copy.mjs";
 import { __iconNode as checkNode } from "lucide-react/dist/esm/icons/check.mjs";
+import { __iconNode as share2Node } from "lucide-react/dist/esm/icons/share-2.mjs";
 
 type LucideNode = ReadonlyArray<
   readonly [tag: string, attributes: Readonly<Record<string, string | number>>]
@@ -41,7 +42,8 @@ const ICON_NODES = {
   send: sendNode,
   "refresh-cw": refreshCwNode,
   copy: copyNode,
-  check: checkNode
+  check: checkNode,
+  "share-2": share2Node
 } as const;
 
 export type LucideIconName = keyof typeof ICON_NODES;

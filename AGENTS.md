@@ -1,0 +1,57 @@
+# GeminiX Architecture, Models & Agent Guidelines
+
+## 1. Gemini Models & API Policy
+
+### Retired / Legacy Models (DO NOT USE)
+
+The following legacy models are retired and MUST NOT be used:
+
+- `gemini-2.5-flash`
+- `gemini-2.5-flash-lite`
+- `gemini-2.0-flash`
+- `gemini-1.5-flash`
+
+### Supported Models
+
+- **Live Session WebSocket (`BidiGenerateContent`)**:
+  - `gemini-3.1-flash-live-preview`
+  - Endpoint: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`
+- **Document OCR / REST Extraction**:
+  - `gemini-3.5-flash-lite` (Primary)
+  - `gemini-3.1-flash-lite` (Fallback)
+
+---
+
+## 2. File & Image Handling Architecture
+
+### Documents (.pdf, .xlsx, .docx, .pptx, etc.)
+
+- **REST Extraction Only**: Documents are processed exclusively through the REST `generateContent` endpoint using `gemini-3.5-flash-lite` / `gemini-3.1-flash-lite`.
+- Extracted text is injected into the text prompt context before sending the turn.
+- Automatic retry on `503`, `500`, and `429` status codes.
+
+### Images (.png, .jpg, .jpeg, .webp)
+
+- **Local Raster-to-Text Context**: Images are decoded locally in pure JS; no
+  image bytes are sent to Gemini and no vision/OCR API is called.
+- Each attachment contributes a bounded luminance ASCII grid, sampled RGB
+  matrix, and coarse SVG colour mosaic to the ordinary `realtimeInput.text`
+  prompt. This preserves coarse layout and colour only; it is not object
+  detection, OCR, or true raster-to-vector conversion.
+
+---
+
+## 3. Webview & UI Constraints
+
+1. **Send Button vs Stop Button**:
+   - During processing, the input area replaces the send icon with an outline stop square (`lucideIconSvg("square", 14)`).
+   - Mic is auto-muted during processing to avoid accidental audio interruptions.
+   - When files or images are attached without typed text, the send button remains enabled so the user can send attachment-only queries.
+2. **User Message Bubble Display**:
+   - When an image or file is sent without accompanying text, only the image thumbnail or file chip is displayed in the user message bubble—no synthetic text like _"Please examine the attached context..."_ is shown to the user.
+3. **Empty Chat Messages**:
+   - `chatSchema.ts` must allow attachment-only messages (empty `spokenText` / `visualText`) without throwing _"A stored chat message has no content."_
+4. **Code & Web Links**:
+   - Code symbols (e.g. `this.secrets.get`) are styled as inline code and must NEVER be treated as external web links.
+   - External links must be validated valid web URLs with valid TLDs before rendering as external links.
+   - File references (e.g. `README.md`, `src/index.ts`) must render as internal clickable links that open the file in the VS Code editor.

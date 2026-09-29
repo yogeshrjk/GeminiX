@@ -207,7 +207,7 @@ Access settings via VS Code's Settings UI (`Cmd+,` / `Ctrl+,`) and search for `l
 
 ```bash
 # Clone the repository
-git clone https://github.com/yogeshrjk/AI-code-explainer-VS-Code-Extension-.git
+git clone https://github.com/yogeshrjk/GeminiX
 cd AI-code-explainer
 
 # Install dependencies

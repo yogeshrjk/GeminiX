@@ -73,12 +73,13 @@ interface CurrentPageSummary {
   readonly label: string;
 }
 
-type AttachmentKind = "currentFile" | "textFile" | "image";
+type AttachmentKind = "currentFile" | "textFile" | "image" | "document";
 
 interface AttachmentSummary {
   readonly id: string;
   readonly kind: AttachmentKind;
   readonly label: string;
+  readonly dataUri?: string;
 }
 
 interface AttachmentDisplay {
@@ -358,7 +359,6 @@ const elements = {
   chatHistoryList: requiredElement<HTMLElement>("chatHistoryList"),
   confirmBulkDeleteButton:
     requiredElement<HTMLButtonElement>("confirmBulkDeleteButton"),
-  clearButton: requiredElement<HTMLButtonElement>("clearButton"),
   configureApiButton:
     requiredElement<HTMLButtonElement>("configureApiButton"),
   currentPageBar: requiredElement<HTMLElement>("currentPageBar"),
@@ -464,6 +464,9 @@ const state = {
   audioMuted: false,
   lastRenderedScreenKey: "",
   suppressNextResponse: false,
+  isProcessing: false,
+  micAutoMuted: false,
+  userMicMutedState: false,
   timer: undefined as number | undefined,
   turns: 0,
   restoringChat: false,
@@ -593,6 +596,7 @@ function renderCurrentPageAttachment(): void {
   elements.currentPageLabel.textContent = visible
     ? (state.currentPage?.relativePath ?? "")
     : "";
+  updateControls();
 }
 
 function updateAttachments(
@@ -603,10 +607,25 @@ function updateAttachments(
     const chip = document.createElement("span");
     chip.className = "attachment-chip";
 
-    const kind = document.createElement("span");
-    kind.className = "attachment-kind";
-    kind.textContent = attachment.kind === "image" ? "▧" : "</>";
-    kind.setAttribute("aria-hidden", "true");
+    let prefix: HTMLElement;
+    if (attachment.kind === "image" && attachment.dataUri) {
+      const thumb = document.createElement("img");
+      thumb.className = "attachment-thumb";
+      thumb.src = attachment.dataUri;
+      thumb.alt = "";
+      prefix = thumb;
+    } else {
+      const kind = document.createElement("span");
+      kind.className = "attachment-kind";
+      kind.textContent =
+        attachment.kind === "image"
+          ? "▧"
+          : attachment.kind === "document"
+            ? "📄"
+            : "</>";
+      kind.setAttribute("aria-hidden", "true");
+      prefix = kind;
+    }
 
     const label = document.createElement("span");
     label.className = "attachment-label";
@@ -627,12 +646,13 @@ function updateAttachments(
       });
     });
 
-    chip.append(kind, label, remove);
+    chip.append(prefix, label, remove);
     return chip;
   });
 
   elements.attachmentList.replaceChildren(...chips);
   elements.attachmentList.classList.toggle("hidden", chips.length === 0);
+  updateControls();
 }
 
 function setAttachmentMenu(open: boolean): void {
@@ -820,9 +840,26 @@ function updateControls(): void {
       ? "End live session"
       : "Start live session";
   elements.textInput.disabled = false;
-  elements.sendButton.disabled =
-    Boolean(state.pendingTextSubmission) ||
-    !elements.textInput.value.trim();
+
+  if (state.isProcessing) {
+    elements.sendButton.disabled = false;
+    elements.sendButton.className = "send-button is-stopping";
+    elements.sendButton.title = "Stop response";
+    elements.sendButton.setAttribute("aria-label", "Stop response");
+    elements.sendButton.innerHTML = lucideIconSvg("square", 14);
+  } else {
+    elements.sendButton.className = "send-button";
+    elements.sendButton.title = "Send";
+    elements.sendButton.setAttribute("aria-label", "Send message");
+    elements.sendButton.innerHTML =
+      '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.2 2.4a.65.65 0 0 1 .72-.12l10.2 5.1a.7.7 0 0 1 0 1.24l-10.2 5.1A.65.65 0 0 1 2 13.08L3.1 9 8.3 8 3.1 7 2 2.92a.65.65 0 0 1 .2-.52z"/></svg>';
+    const hasContent =
+      Boolean(elements.textInput.value.trim()) ||
+      state.attachments.length > 0 ||
+      Boolean(state.attachedCurrentPage && state.currentPage);
+    elements.sendButton.disabled =
+      Boolean(state.pendingTextSubmission) || !hasContent;
+  }
 
   // Show live-session controls only when the session is actively connected.
   elements.muteMicButton.hidden = !state.sessionReady;
@@ -971,10 +1008,21 @@ function createMessage(
     currentPageLabel
   });
 
-  if (role === "user") {
-    const actions = document.createElement("div");
-    actions.className = "message-actions";
+  const footer = document.createElement("div");
+  footer.className = "message-footer";
 
+  const timeSpan = document.createElement("span");
+  timeSpan.className = "message-time";
+  const date = new Date(storedMessage?.createdAt ?? Date.now());
+  timeSpan.textContent = date.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit"
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+
+  if (role === "user") {
     const copyButton = document.createElement("button");
     copyButton.type = "button";
     copyButton.className = "message-action-button";
@@ -1012,7 +1060,32 @@ function createMessage(
     });
 
     actions.append(copyButton, regenerateButton, editButton);
-    wrapper.append(actions);
+    footer.append(timeSpan, actions);
+    wrapper.append(footer);
+  } else {
+    const copyButton = document.createElement("button");
+    copyButton.type = "button";
+    copyButton.className = "message-action-button";
+    copyButton.title = "Copy response";
+    copyButton.setAttribute("aria-label", "Copy response");
+    copyButton.innerHTML = lucideIconSvg("copy", 12);
+    copyButton.addEventListener("click", () => {
+      copyModelMessage(message, copyButton);
+    });
+
+    const shareButton = document.createElement("button");
+    shareButton.type = "button";
+    shareButton.className = "message-action-button";
+    shareButton.title = "Share response";
+    shareButton.setAttribute("aria-label", "Share response");
+    shareButton.innerHTML = lucideIconSvg("share-2", 12);
+    shareButton.addEventListener("click", () => {
+      shareModelMessage(message, shareButton);
+    });
+
+    actions.append(copyButton, shareButton);
+    footer.append(timeSpan, actions);
+    body.append(footer);
   }
 
   return message;
@@ -1038,6 +1111,73 @@ function copyUserMessage(
   }, 1_200);
 }
 
+function getModelMessageFullText(message: TranscriptMessage): string {
+  const parts: string[] = [];
+  if (message.visualText.trim()) {
+    parts.push(message.visualText.trim());
+  }
+  for (const block of message.markdownBlocks) {
+    if (block.markdown.trim()) {
+      parts.push(block.markdown.trim());
+    }
+  }
+  if (!parts.length && message.spokenText.trim()) {
+    parts.push(message.spokenText.trim());
+  }
+  return parts.join("\n\n");
+}
+
+function copyModelMessage(
+  message: TranscriptMessage,
+  button: HTMLButtonElement
+): void {
+  const text = getModelMessageFullText(message);
+  if (!text) {
+    return;
+  }
+  vscode.postMessage({ type: "copyCode", code: text });
+  button.innerHTML = lucideIconSvg("check", 12);
+  button.title = "Copied";
+  button.setAttribute("aria-label", "Copied");
+  window.setTimeout(() => {
+    button.innerHTML = lucideIconSvg("copy", 12);
+    button.title = "Copy response";
+    button.setAttribute("aria-label", "Copy response");
+  }, 1_200);
+}
+
+function shareModelMessage(
+  message: TranscriptMessage,
+  button: HTMLButtonElement
+): void {
+  const text = getModelMessageFullText(message);
+  if (!text) {
+    return;
+  }
+
+  if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
+    navigator
+      .share({
+        title: "GeminiX Response",
+        text
+      })
+      .catch(() => {
+        vscode.postMessage({ type: "copyCode", code: text });
+      });
+  } else {
+    vscode.postMessage({ type: "copyCode", code: text });
+  }
+
+  button.innerHTML = lucideIconSvg("check", 12);
+  button.title = "Copied to share";
+  button.setAttribute("aria-label", "Copied to share");
+  window.setTimeout(() => {
+    button.innerHTML = lucideIconSvg("share-2", 12);
+    button.title = "Share response";
+    button.setAttribute("aria-label", "Share response");
+  }, 1_200);
+}
+
 function regenerateUserMessage(message: TranscriptMessage): void {
   const question = message.spokenText.trim();
   if (!question) {
@@ -1051,6 +1191,8 @@ function regenerateUserMessage(message: TranscriptMessage): void {
   const value =
     "The user wants a more detailed and better answer to their previous question. " +
     `Previous question: ${question}`;
+
+  startProcessing(false, false);
 
   if (state.sessionReady) {
     vscode.postMessage({
@@ -1085,10 +1227,6 @@ function appendTranscript(
   currentPage?: CurrentPageSummary
 ): void {
   if (role === "user") {
-    if (!text) {
-      return;
-    }
-
     let message = state.currentUserMessage;
 
     if (!message || message.closed) {
@@ -1096,20 +1234,22 @@ function appendTranscript(
       state.currentUserMessage = message;
     }
 
-    message.spokenText = mergeSpokenText(message.spokenText, text);
-    const storedIndex = state.chatMessages.findIndex(
-      (candidate) => candidate.id === message.id
-    );
-    if (storedIndex >= 0) {
-      const existing = state.chatMessages[storedIndex];
-      if (existing) {
-        state.chatMessages[storedIndex] = {
-          ...existing,
-          spokenText: message.spokenText
-        };
+    if (text) {
+      message.spokenText = mergeSpokenText(message.spokenText, text);
+      const storedIndex = state.chatMessages.findIndex(
+        (candidate) => candidate.id === message.id
+      );
+      if (storedIndex >= 0) {
+        const existing = state.chatMessages[storedIndex];
+        if (existing) {
+          state.chatMessages[storedIndex] = {
+            ...existing,
+            spokenText: message.spokenText
+          };
+        }
       }
+      message.content.textContent = message.spokenText;
     }
-    message.content.textContent = message.spokenText;
     scheduleChatSave();
     scrollTranscriptToBottom("auto");
   }
@@ -1221,6 +1361,8 @@ function sendCorrectedQuestion(text: string): void {
   clearError();
   const requestId = crypto.randomUUID();
   const chatId = ensureActiveChat(trimmed);
+
+  startProcessing(false, false);
 
   if (state.sessionReady) {
     vscode.postMessage({
@@ -1437,6 +1579,28 @@ const SPECIAL_FILE_NAMES = new Set([
   ".eslintrc"
 ]);
 
+// Well-known library / framework / technology names that end in extensions like .js
+// but must NOT be treated as workspace file links.
+const NON_FILE_NAMES = new Set([
+  "node.js",
+  "vue.js",
+  "react.js",
+  "next.js",
+  "nuxt.js",
+  "express.js",
+  "three.js",
+  "d3.js",
+  "chart.js",
+  "ember.js",
+  "moment.js",
+  "day.js",
+  "anime.js",
+  "redux.js",
+  "backbone.js",
+  "socket.io",
+  "electron.js"
+]);
+
 const INLINE_CODE_PATTERN = /`([^`\n]+)`/gu;
 const MARKDOWN_LINK_PATTERN = /\[([^[\]]+)\]\(([^()\s]+)\)/gu;
 const BARE_URL_PATTERN = /(^|[\s([{'"<>;*_~])https?:\/\/[^\s<)"'`]+/giu;
@@ -1475,6 +1639,9 @@ function matchFileReference(value: string): FileReference | undefined {
   }
   const line = match[2] ? Number(match[2]) : undefined;
   const basename = path.slice(path.lastIndexOf("/") + 1);
+  if (NON_FILE_NAMES.has(basename.toLowerCase())) {
+    return undefined;
+  }
   if (
     !SPECIAL_FILE_NAMES.has(basename.toLowerCase()) &&
     !FILE_EXTENSION_PATTERN.test(basename)
@@ -1488,6 +1655,24 @@ function matchFileReference(value: string): FileReference | undefined {
   };
 }
 
+const WEB_DOMAIN_TLDS =
+  "org|com|net|io|dev|edu|gov|co|app|ai|me|info|tech|so|site|xyz|cloud|page";
+
+const BARE_DOMAIN_PATTERN = new RegExp(
+  "(^|[\\s([{'\"<>;*_~])((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+(?:" +
+    WEB_DOMAIN_TLDS +
+    ")(?:/[^\\s<)\"'`]*))",
+  "giu"
+);
+
+function normalizeSpokenUrls(text: string): string {
+  return text
+    .replace(/\bhttps?[\s:]+([a-zA-Z0-9-]+)[\s.]+([a-zA-Z0-9-]+)[\s.]+(org|com|net|io|dev|edu|gov)\b/giu, "https://$1.$2.$3")
+    .replace(/\bhttps?[\s:]+([a-zA-Z0-9-]+)[\s.]+(org|com|net|io|dev|edu|gov)\b/giu, "https://$1.$2")
+    .replace(/\b([a-zA-Z0-9-]+)\s+(?:dot|\.)\s+([a-zA-Z0-9-]+)\s+(?:dot|\.)\s+(org|com|net|io|dev|edu|gov)\b/giu, "$1.$2.$3")
+    .replace(/\b([a-zA-Z0-9-]+)\s+(?:dot|\.)\s+(org|com|net|io|dev|edu|gov)\b/giu, "$1.$2");
+}
+
 function buildFileLinkHtml(
   path: string,
   label: string,
@@ -1498,7 +1683,9 @@ function buildFileLinkHtml(
 }
 
 function buildExternalLinkHtml(url: string, label: string): string {
-  return `<a href="${escapeHtml(url)}" class="external-link" target="_blank" rel="noreferrer" title="${escapeHtml(url)}">${escapeHtml(label)}</a>`;
+  const cleanUrl = url.trim();
+  const href = /^https?:\/\//i.test(cleanUrl) ? cleanUrl : `https://${cleanUrl}`;
+  return `<a href="${escapeHtml(href)}" class="external-link" target="_blank" rel="noreferrer" title="${escapeHtml(href)}">${escapeHtml(label)}</a>`;
 }
 
 function buildMarkdownLinkHtml(label: string, url: string): string {
@@ -1531,7 +1718,7 @@ function renderInlineMarkdown(text: string): string {
       (_, index: string) => replacements[Number(index)] ?? ""
     );
 
-  let processed = text;
+  let processed = normalizeSpokenUrls(text);
 
   // 1) Markdown links, [label](https://…), [label](src/main.ts), ...
   processed = processed.replace(
@@ -1552,7 +1739,19 @@ function renderInlineMarkdown(text: string): string {
     }
   );
 
-  // 3) Inline code spans – file references become links, everything else
+  // 3) Bare domain URLs (e.g. docs.python.org, www.python.org, pypi.org/project/...)
+  processed = processed.replace(
+    BARE_DOMAIN_PATTERN,
+    (match: string, prefix: string, domainUrl: string) => {
+      const url = domainUrl.replace(/[.,;:!?<>]+$/u, "");
+      if (!url || NON_FILE_NAMES.has(url.toLowerCase())) {
+        return match;
+      }
+      return prefix + protect(buildExternalLinkHtml(url, url));
+    }
+  );
+
+  // 4) Inline code spans – file references become links, everything else
   //    stays inline code.
   processed = processed.replace(INLINE_CODE_PATTERN, (_, code: string) => {
     const codeText = unescapeMarkdownPipes(code);
@@ -1562,10 +1761,19 @@ function renderInlineMarkdown(text: string): string {
         buildFileLinkHtml(reference.path, reference.display, reference.line)
       );
     }
+    // If code span contains a web URL like `https://docs.python.org` or `docs.python.org`
+    if (
+      /^(?:https?:\/\/|(?:[a-zA-Z0-9-]+\.)+(?:org|com|net|io|dev|edu|gov))/i.test(
+        codeText
+      ) &&
+      !NON_FILE_NAMES.has(codeText.toLowerCase())
+    ) {
+      return protect(buildExternalLinkHtml(codeText, codeText));
+    }
     return protect(`<code>${escapeHtml(codeText)}</code>`);
   });
 
-  // 4) File references in plain prose (main.ts, src/util/format.ts:12, ...).
+  // 5) File references in plain prose (main.ts, src/util/format.ts:12, ...).
   processed = processed.replace(
     FILE_REFERENCE_PATTERN,
     (match: string, prefix: string, token: string, line?: string) => {
@@ -2171,7 +2379,15 @@ function hideActivityIndicator(): void {
   }
 }
 
+function unmuteMicIfAutoMuted(): void {
+  if (state.micAutoMuted) {
+    state.micAutoMuted = false;
+    vscode.postMessage({ type: "muteMic", muted: state.userMicMutedState });
+  }
+}
+
 function markAnswering(): void {
+  unmuteMicIfAutoMuted();
   if (state.answering) {
     return;
   }
@@ -2197,26 +2413,31 @@ function renderMessageAttachments(
   const container = document.createElement("div");
   container.className = "message-attachments";
   for (const display of displays) {
-    if (display.kind === "image" && display.dataUri) {
-      const image = document.createElement("img");
-      image.className = "message-attachment-image";
-      image.src = display.dataUri;
-      image.alt = display.label;
-      image.title = display.label;
-      container.append(image);
-    } else {
-      const chip = document.createElement("span");
-      chip.className = "message-attachment-chip";
-      chip.title = display.label;
-      const icon = document.createElement("span");
-      icon.className = "message-attachment-chip-icon";
-      icon.innerHTML = lucideIconSvg("file-text", 12);
-      const label = document.createElement("span");
-      label.className = "message-attachment-chip-label";
-      label.textContent = display.label;
-      chip.append(icon, label);
-      container.append(chip);
+    if (display.kind === "image") {
+      if (display.dataUri) {
+        const image = document.createElement("img");
+        image.className = "message-attachment-image";
+        image.src = display.dataUri;
+        image.alt = "Attached image preview";
+        container.append(image);
+      }
+      continue;
     }
+
+    const chip = document.createElement("span");
+    chip.className = "message-attachment-chip";
+    chip.title = display.label;
+    const icon = document.createElement("span");
+    icon.className = "message-attachment-chip-icon";
+    icon.innerHTML =
+      display.kind === "document"
+        ? "📄"
+        : lucideIconSvg("file-text", 12);
+    const label = document.createElement("span");
+    label.className = "message-attachment-chip-label";
+    label.textContent = display.label;
+    chip.append(icon, label);
+    container.append(chip);
   }
   // Attachments appear above the typed text.
   message.content.prepend(container);
@@ -2356,6 +2577,58 @@ async function beginSession(): Promise<void> {
   }
 }
 
+function startProcessing(hasImages: boolean, hasDocs: boolean): void {
+  state.isProcessing = true;
+  state.activeSearches = 0;
+  state.answering = false;
+  state.reasoning = false;
+  state.analyzingImage = hasImages;
+
+  // Auto-mute microphone ONLY when analyzing images or documents so background speech won't disrupt analysis
+  if (hasImages || hasDocs) {
+    state.micAutoMuted = true;
+    state.userMicMutedState = state.micMuted;
+    if (!state.micMuted) {
+      vscode.postMessage({ type: "muteMic", muted: true });
+    }
+  } else {
+    state.micAutoMuted = false;
+  }
+
+  if (hasImages) {
+    setActivityIndicator("image", "Analyzing image source…");
+    setStatus("Analyzing image", "busy");
+  } else if (hasDocs) {
+    setActivityIndicator("book-open", "Analyzing attached files…");
+    setStatus("Reading file", "busy");
+  } else {
+    setActivityIndicator("lightbulb", "Thinking…");
+    setStatus("Thinking", "busy");
+  }
+
+  updateControls();
+}
+
+function endProcessing(): void {
+  if (!state.isProcessing) {
+    return;
+  }
+  state.isProcessing = false;
+  state.analyzingImage = false;
+
+  unmuteMicIfAutoMuted();
+  updateControls();
+}
+
+function stopActiveTurn(): void {
+  stopPlayback();
+  finishTranscriptTurn();
+  hideActivityIndicator();
+  vscode.postMessage({ type: "interruptTurn" });
+  endProcessing();
+  setStatus("Listening", "live");
+}
+
 function dispatchTextSubmission(
   submission: PendingTextSubmission
 ): void {
@@ -2373,8 +2646,19 @@ function dispatchTextSubmission(
 }
 
 function submitTextMessage(): void {
+  // If we are currently processing, clicking the send/stop button stops processing!
+  if (state.isProcessing) {
+    stopActiveTurn();
+    return;
+  }
+
   const text = elements.textInput.value.trim();
-  if (!text || state.pendingTextSubmission) {
+  const hasContent =
+    Boolean(text) ||
+    state.attachments.length > 0 ||
+    Boolean(state.attachedCurrentPage && state.currentPage);
+
+  if (!hasContent || state.pendingTextSubmission) {
     return;
   }
   if (!state.apiConfigured) {
@@ -2383,17 +2667,66 @@ function submitTextMessage(): void {
     return;
   }
 
+  const initialTitle =
+    text || (state.attachments[0]?.label ?? "Attachment Query");
+
+  const currentAttachments = [...state.attachments];
+  const attachedCurrentPage = state.attachedCurrentPage;
+  const currentPage = state.currentPage;
+  const hasImages = currentAttachments.some((a) => a.kind === "image");
+  const hasDocs = currentAttachments.some(
+    (a) => a.kind === "document" || a.kind === "textFile"
+  );
+
   const submission: PendingTextSubmission = {
     requestId: crypto.randomUUID(),
     text,
-    chatId: ensureActiveChat(text),
+    chatId: ensureActiveChat(initialTitle),
     includeCurrentPage:
-      state.attachedCurrentPage && Boolean(state.currentPage),
-    currentPageUri: state.attachedCurrentPage
-      ? state.currentPage?.uri
+      attachedCurrentPage && Boolean(currentPage),
+    currentPageUri: attachedCurrentPage
+      ? currentPage?.uri
       : undefined,
-    attachmentIds: state.attachments.map((attachment) => attachment.id)
+    attachmentIds: currentAttachments.map((attachment) => attachment.id)
   };
+
+  // Append user message to transcript panel immediately
+  appendTranscript(
+    "user",
+    text,
+    state.selection,
+    attachedCurrentPage && currentPage ? currentPage : undefined
+  );
+
+  // Render attachment chips / thumbnails immediately in the user bubble
+  if (state.currentUserMessage) {
+    const displayList: AttachmentDisplay[] = currentAttachments.map((att) => ({
+      id: att.id,
+      kind: att.kind,
+      label: att.label,
+      dataUri: att.dataUri
+    }));
+    renderMessageAttachments(state.currentUserMessage, displayList);
+    state.currentUserMessage.closed = true;
+  }
+
+  if (state.currentModelMessage) {
+    state.currentModelMessage.closed = true;
+  }
+  state.currentUserMessage = undefined;
+  state.currentModelMessage = undefined;
+
+  // Immediately clear the composer input & attachment UI
+  elements.textInput.value = "";
+  resizeComposer();
+  state.attachments = [];
+  state.attachedCurrentPage = false;
+  elements.attachmentList.replaceChildren();
+  elements.attachmentList.classList.add("hidden");
+  renderCurrentPageAttachment();
+
+  // Start processing state: change send button to stop button & auto-mute mic
+  startProcessing(hasImages, hasDocs);
 
   // User submitted a text query — clear any suppression from a prior stop.
   state.suppressNextResponse = false;
@@ -2468,6 +2801,7 @@ function handleServerMessage(payload: unknown): void {
     // previous one.
     if (content.interrupted) {
       finishTranscriptTurn();
+      endProcessing();
     }
 
     // When the user speaks (voice input) after a stop, clear suppression.
@@ -2529,12 +2863,14 @@ function handleServerMessage(payload: unknown): void {
 
     if (shouldInterruptPlayback(content)) {
       stopPlayback();
+      endProcessing();
       setStatus("Listening", "live");
     }
 
     if (content.turnComplete) {
       hideActivityIndicator();
       finishTranscriptTurn();
+      endProcessing();
       if (!state.playbackSources.size) {
         setStatus("Listening", "live");
       }
@@ -2965,51 +3301,49 @@ function handleHostMessage(message: HostMessage): void {
       updateControls();
       setStatus("Disconnected");
       break;
-    case "textAccepted":
-      if (message.text) {
-        // Edit-resends and regenerations reuse the existing question bubble;
-        // only create a new user bubble for a fresh typed message.
-        if (!message.fromEdit) {
-          appendTranscript(
-            "user",
-            message.text,
-            message.context,
-            message.currentPage
+    case "textAccepted": {
+      state.pendingModelApplyTargetId = message.applyTargetId;
+      if (message.attachmentDisplays?.length) {
+        const userMessages =
+          elements.transcript.querySelectorAll<HTMLElement>(".message.user");
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        if (lastUserMsg) {
+          const imgDisplays = message.attachmentDisplays.filter(
+            (d) => d.kind === "image" && d.dataUri
           );
+          if (imgDisplays.length > 0) {
+            let container = lastUserMsg.querySelector<HTMLElement>(
+              ".message-attachments"
+            );
+            if (!container) {
+              container = document.createElement("div");
+              container.className = "message-attachments";
+              lastUserMsg.prepend(container);
+            }
+            container
+              .querySelectorAll(".message-attachment-image")
+              .forEach((el) => el.remove());
+            for (const display of imgDisplays) {
+              if (!display.dataUri) {
+                continue;
+              }
+              const image = document.createElement("img");
+              image.className = "message-attachment-image";
+              image.src = display.dataUri;
+              image.alt = display.label;
+              image.title = display.label;
+              container.append(image);
+            }
+          }
         }
-        if (state.currentUserMessage) {
-          renderMessageAttachments(
-            state.currentUserMessage,
-            message.attachmentDisplays ?? []
-          );
-          state.currentUserMessage.closed = true;
-        }
-        if (state.currentModelMessage) {
-          state.currentModelMessage.closed = true;
-        }
-        state.currentUserMessage = undefined;
-        state.currentModelMessage = undefined;
-        state.pendingModelApplyTargetId = message.applyTargetId;
-        state.attachedCurrentPage = false;
-        renderCurrentPageAttachment();
-        elements.textInput.value = "";
-        resizeComposer();
-        state.activeSearches = 0;
-        state.answering = false;
-        state.reasoning = false;
-        state.analyzingImage = Boolean(message.hasImages);
-        setActivityIndicator(
-          state.analyzingImage ? "image" : "lightbulb",
-          state.analyzingImage ? "Analyzing image source…" : "Thinking…"
-        );
-        setStatus(
-          state.analyzingImage ? "Analyzing image" : "Thinking",
-          "busy"
-        );
       }
       break;
+    }
     case "textRejected":
+      endProcessing();
+      hideActivityIndicator();
       showError(message.message ?? "The message could not be sent.");
+      setStatus("Listening", "live");
       break;
     case "voiceContext":
       state.pendingVoiceContext = message.context;
@@ -3347,8 +3681,6 @@ elements.stopPlaybackButton.addEventListener("click", () => {
   // Tell the server to interrupt the current turn.
   vscode.postMessage({ type: "interruptTurn" });
 });
-
-elements.clearButton.addEventListener("click", startNewChat);
 
 elements.saveApiButton.addEventListener("click", () => {
   const apiKey = elements.apiKeyInput.value.trim();

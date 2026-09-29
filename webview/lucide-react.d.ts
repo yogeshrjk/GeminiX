@@ -102,3 +102,9 @@ declare module "lucide-react/dist/esm/icons/file-text.mjs" {
     readonly [string, Readonly<Record<string, string | number>>]
   >;
 }
+
+declare module "lucide-react/dist/esm/icons/share-2.mjs" {
+  export const __iconNode: ReadonlyArray<
+    readonly [string, Readonly<Record<string, string | number>>]
+  >;
+}

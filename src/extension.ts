@@ -517,8 +517,12 @@ class GeminiXViewProvider
     attachmentIds: readonly string[] | undefined,
     fromEdit: boolean | undefined,
   ): Promise<void> {
-    const userText = text?.trim();
-    if (!userText || !this.session?.isConnected) {
+    const userText = text?.trim() ?? "";
+    const requestedAttachmentIds = attachmentIds ?? [];
+    const hasAttachments =
+      requestedAttachmentIds.length > 0 || Boolean(includeCurrentPage);
+
+    if ((!userText && !hasAttachments) || !this.session?.isConnected) {
       this.post({
         type: "textRejected",
         requestId,
@@ -534,9 +538,10 @@ class GeminiXViewProvider
     const applyTargetId = this.registerApplyTarget(context);
     this.turnPrimaryContext = context;
     this.workspaceToolCallsThisTurn = 0;
-    const requestedAttachmentIds = attachmentIds ?? [];
+    const apiKey = await this.secrets.get(API_KEY_SECRET);
     const preparedAttachments = await this.attachmentStore.prepare(
       requestedAttachmentIds,
+      apiKey,
     );
 
     const displayAttachments = await this.attachmentStore.displayInfo(
@@ -1306,10 +1311,6 @@ class GeminiXViewProvider
           <div id="errorBox" class="error-box hidden" role="alert"></div>
 
           <section class="transcript-section">
-            <div class="section-heading">
-              <span>Chat</span>
-            <button id="clearButton" class="text-button" type="button">New chat</button>
-            </div>
             <div id="transcript" class="transcript" aria-live="polite">
               <div id="emptyState" class="empty-state">
                 <strong>Ask about the code you are working on</strong>

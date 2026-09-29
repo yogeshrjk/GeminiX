@@ -28,7 +28,7 @@ interface ParsedRow {
 
 const OPENING_FENCE_PATTERN = /^```([A-Za-z0-9_+#.-]*)[ \t]*$/u;
 const CLOSING_FENCE_PATTERN = /^```[ \t]*$/u;
-const SEPARATOR_CELL_PATTERN = /^:?-{3,}:?$/u;
+const SEPARATOR_CELL_PATTERN = /^:?-+:?$/u;
 
 export function parseRichContent(source: string): readonly RichContentSegment[] {
   if (!source) {

@@ -7,22 +7,45 @@ import {
 } from "./editorContext.js";
 import type {
   AttachmentDisplay,
+  AttachmentKind,
   AttachmentSummary,
   CurrentPageContext,
   ImageContext
 } from "./types.js";
 
-const MAX_ATTACHMENTS = 6;
-const MAX_IMAGE_ATTACHMENTS = 3;
-const MAX_TEXT_FILE_BYTES = 1 * 1_024 * 1_024;
-const MAX_IMAGE_FILE_BYTES = 12 * 1_024 * 1_024;
-const MAX_ATTACHMENT_TEXT_CHARACTERS = 80_000;
+const MAX_ATTACHMENTS = 8;
+const MAX_IMAGE_ATTACHMENTS = 5;
+const MAX_DOCUMENT_ATTACHMENTS = 5;
+const MAX_TEXT_FILE_BYTES = 2 * 1_024 * 1_024;
+const MAX_DOCUMENT_FILE_BYTES = 25 * 1_024 * 1_024;
+const MAX_IMAGE_FILE_BYTES = 25 * 1_024 * 1_024;
+const MAX_ATTACHMENT_TEXT_CHARACTERS = 100_000;
 
-const IMAGE_MIME_TYPES = new Map([
+const IMAGE_MIME_TYPES = new Map<string, string>([
   [".jpeg", "image/jpeg"],
   [".jpg", "image/jpeg"],
   [".png", "image/png"],
-  [".webp", "image/webp"]
+  [".webp", "image/webp"],
+  [".gif", "image/gif"],
+  [".bmp", "image/bmp"],
+  [".svg", "image/svg+xml"],
+  [".tiff", "image/tiff"],
+  [".tif", "image/tiff"],
+  [".heic", "image/heic"],
+  [".heif", "image/heif"]
+]);
+
+const DOCUMENT_MIME_TYPES = new Map<string, string>([
+  [".pdf", "application/pdf"],
+  [".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+  [".doc", "application/msword"],
+  [".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+  [".xls", "application/vnd.ms-excel"],
+  [".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+  [".ppt", "application/vnd.ms-powerpoint"],
+  [".rtf", "application/rtf"],
+  [".csv", "text/csv"],
+  [".tsv", "text/tab-separated-values"]
 ]);
 
 function sniffImageMimeType(bytes: Uint8Array): string | undefined {
@@ -49,7 +72,124 @@ function sniffImageMimeType(bytes: Uint8Array): string | undefined {
   if (startsWith(0, [0x47, 0x49, 0x46, 0x38])) {
     return "image/gif";
   }
+  // BMP: BM (0x42, 0x4D)
+  if (startsWith(0, [0x42, 0x4d])) {
+    return "image/bmp";
+  }
+  // TIFF: II*. or MM.*
+  if (
+    startsWith(0, [0x49, 0x49, 0x2a, 0x00]) ||
+    startsWith(0, [0x4d, 0x4d, 0x00, 0x2a])
+  ) {
+    return "image/tiff";
+  }
   return undefined;
+}
+
+function sniffDocumentMimeType(bytes: Uint8Array): string | undefined {
+  const startsWith = (offset: number, expected: readonly number[]): boolean =>
+    expected.every((byte, index) => bytes[offset + index] === byte);
+
+  // PDF: %PDF- (0x25, 0x50, 0x44, 0x46, 0x2D)
+  if (startsWith(0, [0x25, 0x50, 0x44, 0x46, 0x2d])) {
+    return "application/pdf";
+  }
+  // RTF: {\rtf (0x7B, 0x5C, 0x72, 0x74, 0x66)
+  if (startsWith(0, [0x7b, 0x5c, 0x72, 0x74, 0x66])) {
+    return "application/rtf";
+  }
+  return undefined;
+}
+
+const VISION_MODELS = [
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite"
+] as const;
+
+async function extractWithGoogleVision(
+  bytes: Uint8Array,
+  mimeType: string,
+  fileName: string,
+  kind: "image" | "document",
+  apiKey: string
+): Promise<string> {
+  const base64Data = Buffer.from(bytes).toString("base64");
+  const prompt =
+    kind === "document"
+      ? `Extract and transcribe the full content of this document "${fileName}" thoroughly into clean Markdown. Include all text, code snippets, headers, sections, tables, formulas, lists, diagram descriptions, and structural elements accurately.`
+      : `Perform thorough Google Vision analysis and OCR on this image "${fileName}". Transcribe all visible text and code verbatim, describe diagrams, UI components, architecture flowcharts, error logs, charts, and visual elements in clean Markdown.`;
+
+  for (const model of VISION_MODELS) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 500 * Math.pow(2, attempt - 1))
+        );
+      }
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType,
+                      data: base64Data
+                    }
+                  },
+                  {
+                    text: prompt
+                  }
+                ]
+              }
+            ]
+          })
+        });
+
+        if (
+          response.status === 429 ||
+          response.status === 500 ||
+          response.status === 503 ||
+          response.status === 504
+        ) {
+          continue;
+        }
+
+        if (!response.ok) {
+          break;
+        }
+
+        const data: unknown = await response.json();
+        if (typeof data !== "object" || data === null) {
+          break;
+        }
+        const candidates = (data as { readonly candidates?: readonly unknown[] })
+          .candidates;
+        const candidate = candidates?.[0] as
+          | { readonly content?: { readonly parts?: readonly { readonly text?: string }[] } }
+          | undefined;
+        const textParts = candidate?.content?.parts
+          ?.map((part) => part.text || "")
+          .filter(Boolean)
+          .join("\n\n");
+
+        if (textParts && textParts.trim()) {
+          return textParts.trim();
+        }
+        break;
+      } catch {
+        // Retry or fallback to next model
+      }
+    }
+  }
+  return "";
 }
 
 const TEXT_EXTENSIONS = new Set([
@@ -155,18 +295,40 @@ export class AttachmentStore {
     selectionKind: "text" | "image"
   ): Promise<readonly AttachmentSummary[]> {
     const isImageSelection = selectionKind === "image";
+    const docAndTextExts = [
+      ...DOCUMENT_MIME_TYPES.keys(),
+      ...TEXT_EXTENSIONS
+    ].map((ext) => (ext.startsWith(".") ? ext.slice(1) : ext));
+
+    const imageExts = [...IMAGE_MIME_TYPES.keys()].map((ext) =>
+      ext.startsWith(".") ? ext.slice(1) : ext
+    );
+
     const uris = await vscode.window.showOpenDialog({
       canSelectFiles: true,
       canSelectFolders: false,
       canSelectMany: true,
       openLabel: isImageSelection ? "Add images" : "Add files",
       title: isImageSelection
-        ? "Add image context to GeminiX"
-        : "Add file context to GeminiX",
+        ? "Add image context to GeminiX (Google Vision)"
+        : "Add file context to GeminiX (Google Vision & Files)",
       filters: isImageSelection
-        ? { Images: ["jpg", "jpeg", "png", "webp"] }
+        ? { Images: imageExts }
         : {
-            "Code and text": [...TEXT_EXTENSIONS].map((extension) =>
+            "All Supported Files": docAndTextExts,
+            Documents: [
+              "pdf",
+              "docx",
+              "doc",
+              "xlsx",
+              "xls",
+              "pptx",
+              "ppt",
+              "rtf",
+              "csv",
+              "tsv"
+            ],
+            "Code and Text": [...TEXT_EXTENSIONS].map((extension) =>
               extension.slice(1)
             )
           }
@@ -188,11 +350,35 @@ export class AttachmentStore {
 
       const extension = extname(uri.path).toLowerCase();
       const imageMimeType = IMAGE_MIME_TYPES.get(extension);
-      const kind = imageMimeType ? "image" : "textFile";
-      if (!imageMimeType && !TEXT_EXTENSIONS.has(extension)) {
-        throw new Error(
-          `${basename(uri.fsPath)} is not a supported code, text, or image file.`
-        );
+      const documentMimeType = DOCUMENT_MIME_TYPES.get(extension);
+
+      let kind: AttachmentKind;
+      let mimeType: string | undefined;
+
+      if (imageMimeType) {
+        kind = "image";
+        mimeType = imageMimeType;
+      } else if (documentMimeType) {
+        kind = "document";
+        mimeType = documentMimeType;
+      } else if (TEXT_EXTENSIONS.has(extension)) {
+        kind = "textFile";
+      } else {
+        const sample = await vscode.workspace.fs.readFile(uri);
+        const sniffedImg = sniffImageMimeType(sample);
+        const sniffedDoc = sniffDocumentMimeType(sample);
+        if (sniffedImg) {
+          kind = "image";
+          mimeType = sniffedImg;
+        } else if (sniffedDoc) {
+          kind = "document";
+          mimeType = sniffedDoc;
+        } else if (!sample.slice(0, 1024).includes(0)) {
+          kind = "textFile";
+        } else {
+          kind = "document";
+          mimeType = "application/octet-stream";
+        }
       }
 
       const imageCount = [...this.attachments.values()].filter(
@@ -204,9 +390,22 @@ export class AttachmentStore {
         );
       }
 
+      const documentCount = [...this.attachments.values()].filter(
+        (attachment) => attachment.summary.kind === "document"
+      ).length;
+      if (kind === "document" && documentCount >= MAX_DOCUMENT_ATTACHMENTS) {
+        throw new Error(
+          `GeminiX accepts up to ${MAX_DOCUMENT_ATTACHMENTS} documents per message.`
+        );
+      }
+
       const stat = await vscode.workspace.fs.stat(uri);
       const maximumBytes =
-        kind === "image" ? MAX_IMAGE_FILE_BYTES : MAX_TEXT_FILE_BYTES;
+        kind === "image"
+          ? MAX_IMAGE_FILE_BYTES
+          : kind === "document"
+            ? MAX_DOCUMENT_FILE_BYTES
+            : MAX_TEXT_FILE_BYTES;
       if (stat.size > maximumBytes) {
         const maximumMegabytes = Math.floor(maximumBytes / 1_024 / 1_024);
         throw new Error(
@@ -214,15 +413,24 @@ export class AttachmentStore {
         );
       }
 
+      let dataUri: string | undefined;
+      if (kind === "image") {
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const actualMime =
+          sniffImageMimeType(bytes) ?? mimeType ?? "image/png";
+        dataUri = `data:${actualMime};base64,${Buffer.from(bytes).toString("base64")}`;
+      }
+
       const summary: AttachmentSummary = {
         id: randomUUID(),
         kind,
-        label: basename(uri.fsPath)
+        label: basename(uri.fsPath),
+        dataUri
       };
       this.attachments.set(summary.id, {
         summary,
         uri,
-        mimeType: imageMimeType
+        mimeType
       });
       added.push(summary);
     }
@@ -238,7 +446,8 @@ export class AttachmentStore {
   }
 
   public async prepare(
-    requestedIds: readonly string[]
+    requestedIds: readonly string[],
+    apiKey?: string
   ): Promise<PreparedAttachments> {
     const requested = requestedIds
       .map((id) => this.attachments.get(id))
@@ -255,29 +464,105 @@ export class AttachmentStore {
           continue;
         }
         const bytes = await vscode.workspace.fs.readFile(attachment.uri);
-        // Prefer the MIME type sniffed from the file's magic bytes over the
-        // extension-based guess so renamed or mismatched files are still
-        // sent to Gemini with the correct MIME type.
         const mimeType =
-          sniffImageMimeType(bytes) ?? attachment.mimeType;
-        if (!mimeType) {
-          continue;
-        }
+          sniffImageMimeType(bytes) ?? attachment.mimeType ?? "image/png";
+
         images.push({
           data: Buffer.from(bytes).toString("base64"),
           label: attachment.summary.label,
           mimeType
         });
-        promptSections.push(
-          [
-            `Attached image: ${attachment.summary.label}`,
-            "The image is sent as a Gemini Live visual frame immediately before the user request. Inspect its visible content and use it as supporting context."
-          ].join("\n")
-        );
+
+        let visionOcrText = "";
+        if (apiKey) {
+          visionOcrText = await extractWithGoogleVision(
+            bytes,
+            mimeType,
+            attachment.summary.label,
+            "image",
+            apiKey
+          );
+        }
+
+        if (visionOcrText) {
+          promptSections.push(
+            [
+              `Attached image: ${attachment.summary.label}`,
+              "Google Vision OCR & Visual Analysis:",
+              visionOcrText
+            ].join("\n\n")
+          );
+        } else {
+          promptSections.push(
+            [
+              `Attached image: ${attachment.summary.label}`,
+              "The image is sent as a visual frame. Inspect its visible content and use it as supporting context."
+            ].join("\n")
+          );
+        }
         continue;
       }
 
-      const textAttachment = await this.readTextAttachment(attachment);
+      if (attachment.summary.kind === "document") {
+        if (!attachment.uri) {
+          continue;
+        }
+        const bytes = await vscode.workspace.fs.readFile(attachment.uri);
+        const mimeType =
+          sniffDocumentMimeType(bytes) ??
+          attachment.mimeType ??
+          DOCUMENT_MIME_TYPES.get(extname(attachment.uri.path).toLowerCase()) ??
+          "application/pdf";
+
+        let documentText = "";
+        if (apiKey) {
+          documentText = await extractWithGoogleVision(
+            bytes,
+            mimeType,
+            attachment.summary.label,
+            "document",
+            apiKey
+          );
+        }
+
+        if (documentText) {
+          const acceptedText = documentText.slice(0, remainingTextCharacters);
+          remainingTextCharacters -= acceptedText.length;
+          promptSections.push(
+            [
+              `Attached document (Google Vision extraction): ${attachment.summary.label}`,
+              acceptedText.length < documentText.length
+                ? "Note: The document content was truncated at the safe context limit."
+                : "",
+              acceptedText
+            ]
+              .filter(Boolean)
+              .join("\n\n")
+          );
+        } else {
+          try {
+            const doc = await vscode.workspace.openTextDocument(attachment.uri);
+            const text = doc.getText();
+            if (!text.includes("\u0000")) {
+              const accepted = text.slice(0, remainingTextCharacters);
+              remainingTextCharacters -= accepted.length;
+              promptSections.push(
+                [
+                  `Attached document: ${attachment.summary.label}`,
+                  accepted
+                ].join("\n\n")
+              );
+            }
+          } catch {
+            promptSections.push(
+              `Attached document: ${attachment.summary.label} (Google Vision extraction pending or unavailable)`
+            );
+          }
+        }
+        continue;
+      }
+
+      const textAttachment = await this.readTextAttachment(attachment, apiKey);
       if (!textAttachment || remainingTextCharacters <= 0) {
         continue;
       }
@@ -306,7 +591,7 @@ export class AttachmentStore {
     return {
       prompt: promptSections.length
         ? [
-            "Use these explicitly attached files as private supporting context.",
+            "Use these explicitly attached files, images, and documents as private supporting context.",
             "If selected editor code is also supplied, the selected code remains primary.",
             ...promptSections
           ].join("\n\n")
@@ -330,18 +615,21 @@ export class AttachmentStore {
       if (!attachment) {
         continue;
       }
-      if (attachment.summary.kind === "image" && attachment.uri) {
-        const bytes = await vscode.workspace.fs.readFile(attachment.uri);
-        const mimeType = sniffImageMimeType(bytes) ?? attachment.mimeType;
-        if (mimeType) {
-          result.push({
-            id,
-            kind: "image",
-            label: attachment.summary.label,
-            dataUri: `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`
-          });
-          continue;
+      if (attachment.summary.kind === "image") {
+        let dataUri = attachment.summary.dataUri;
+        if (!dataUri && attachment.uri) {
+          const bytes = await vscode.workspace.fs.readFile(attachment.uri);
+          const mimeType =
+            sniffImageMimeType(bytes) ?? attachment.mimeType ?? "image/png";
+          dataUri = `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`;
         }
+        result.push({
+          id,
+          kind: "image",
+          label: attachment.summary.label,
+          dataUri
+        });
+        continue;
       }
       result.push({
         id,
@@ -361,7 +649,8 @@ export class AttachmentStore {
   }
 
   private async readTextAttachment(
-    attachment: StoredAttachment
+    attachment: StoredAttachment,
+    apiKey?: string
   ): Promise<
     | {
         readonly languageId: string;
@@ -383,18 +672,48 @@ export class AttachmentStore {
       return undefined;
     }
 
-    const document = await vscode.workspace.openTextDocument(attachment.uri);
-    const completeText = document.getText();
-    if (completeText.includes("\u0000")) {
-      throw new Error(
-        `${attachment.summary.label} appears to be a binary file.`
-      );
+    try {
+      const document = await vscode.workspace.openTextDocument(attachment.uri);
+      const completeText = document.getText();
+      if (!completeText.includes("\u0000")) {
+        return {
+          languageId: document.languageId || "text",
+          relativePath: vscode.workspace.asRelativePath(attachment.uri, false),
+          text: completeText,
+          truncated: false
+        };
+      }
+    } catch {
+      // Fall through to binary extraction
     }
-    return {
-      languageId: document.languageId,
-      relativePath: vscode.workspace.asRelativePath(attachment.uri, false),
-      text: completeText,
-      truncated: false
-    };
+
+    // Binary file fallback through Google Vision extraction
+    if (apiKey) {
+      const bytes = await vscode.workspace.fs.readFile(attachment.uri);
+      const ext = extname(attachment.uri.path).toLowerCase();
+      const mimeType =
+        DOCUMENT_MIME_TYPES.get(ext) ??
+        IMAGE_MIME_TYPES.get(ext) ??
+        "application/octet-stream";
+      const extracted = await extractWithGoogleVision(
+        bytes,
+        mimeType,
+        attachment.summary.label,
+        "document",
+        apiKey
+      );
+      if (extracted) {
+        return {
+          languageId: "markdown",
+          relativePath: vscode.workspace.asRelativePath(attachment.uri, false),
+          text: extracted,
+          truncated: false
+        };
+      }
+    }
+
+    throw new Error(
+      `${attachment.summary.label} is a binary file that could not be read.`
+    );
   }
 }

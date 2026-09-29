@@ -108,12 +108,13 @@ export interface CurrentPageSummary {
   readonly label: string;
 }
 
-export type AttachmentKind = "currentFile" | "textFile" | "image";
+export type AttachmentKind = "currentFile" | "textFile" | "image" | "document";
 
 export interface AttachmentSummary {
   readonly id: string;
   readonly kind: AttachmentKind;
   readonly label: string;
+  readonly dataUri?: string;
 }
 
 export interface AttachmentDisplay {

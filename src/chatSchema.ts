@@ -27,14 +27,6 @@ export function parseChatMessage(
   );
   const markdownBlocks = readMarkdownBlocks(value["markdownBlocks"], maxCharacters);
 
-  if (
-    !spokenText.trim() &&
-    !visualText?.trim() &&
-    !markdownBlocks.length
-  ) {
-    throw new Error("A stored chat message has no content.");
-  }
-
   return {
     id: readRequiredString(value, "id").slice(0, 80),
     role,

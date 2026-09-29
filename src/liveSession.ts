@@ -167,34 +167,41 @@ export class LiveSession {
     text: string,
     images: readonly ImageContext[] = []
   ): boolean {
-    if (!images.length) {
-      return this.send({ realtimeInput: { text } });
+    if (images.length > 0) {
+      for (const image of images) {
+        this.send({
+          realtimeInput: {
+            video: {
+              data: image.data,
+              mimeType: image.mimeType.startsWith("image/")
+                ? image.mimeType
+                : "image/jpeg"
+            }
+          }
+        });
+      }
+
+      const parts: unknown[] = images.map((image) => ({
+        inlineData: {
+          data: image.data,
+          mimeType: image.mimeType
+        }
+      }));
+      parts.push({ text });
+      this.send({
+        clientContent: {
+          turns: [
+            {
+              role: "user",
+              parts
+            }
+          ],
+          turnComplete: true
+        }
+      });
     }
 
-    // Attached images are sent together with the text as a single
-    // clientContent turn. Unlike realtimeInput, whose audio/video/text
-    // streams are processed concurrently without ordering guarantees, the
-    // parts of a clientContent turn are committed atomically. Gemini only
-    // starts responding after the whole turn (image + text) has been
-    // ingested, so it cannot answer the text before the image is analyzed.
-    const parts: unknown[] = images.map((image) => ({
-      inlineData: {
-        data: image.data,
-        mimeType: image.mimeType
-      }
-    }));
-    parts.push({ text });
-    return this.send({
-      clientContent: {
-        turns: [
-          {
-            role: "user",
-            parts
-          }
-        ],
-        turnComplete: true
-      }
-    });
+    return this.send({ realtimeInput: { text } });
   }
 
   public sendToolResponses(
@@ -234,13 +241,12 @@ export class LiveSession {
     }
 
     if (!this.setupComplete) {
-      if (this.isRealtimeInput(payload)) {
-        // Real-time audio/text captured before the session is ready is
-        // transient. Replaying it after setup would feed the model stale
-        // input, so drop it instead of queueing it.
+      if (this.isTransientRealtimeInput(payload)) {
+        // Real-time mic audio captured before the session is ready is
+        // transient. Drop only mic audio frames, not text turns.
         return true;
       }
-      // Defer discrete messages (clientContent turns, tool responses) until
+      // Defer discrete messages (user turns, tool responses) until
       // the server acknowledges setup, then flush them in order.
       if (this.pendingMessages.length < MAX_PENDING_MESSAGES) {
         this.pendingMessages.push(payload);
@@ -320,12 +326,13 @@ export class LiveSession {
     }
   }
 
-  private isRealtimeInput(payload: unknown): boolean {
-    return (
-      typeof payload === "object" &&
-      payload !== null &&
-      "realtimeInput" in (payload as Readonly<Record<string, unknown>>)
-    );
+  private isTransientRealtimeInput(payload: unknown): boolean {
+    if (typeof payload !== "object" || payload === null) {
+      return false;
+    }
+    const realtime = (payload as { realtimeInput?: { audio?: unknown } })
+      .realtimeInput;
+    return Boolean(realtime?.audio);
   }
 
   private createSetupMessage(preferences: Preferences): unknown {
@@ -335,9 +342,6 @@ export class LiveSession {
         generationConfig: {
           responseModalities: ["AUDIO"],
           temperature: 0.3,
-          thinkingConfig: {
-            thinkingLevel: "MEDIUM"
-          },
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
@@ -449,26 +453,7 @@ export class LiveSession {
               }
             ]
           }
-        ],
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        realtimeInputConfig: {
-          automaticActivityDetection: {
-            disabled: false,
-            startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
-            endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
-            prefixPaddingMs: 500,
-            silenceDurationMs: 900
-          },
-          activityHandling: preferences.autoInterrupt
-            ? "START_OF_ACTIVITY_INTERRUPTS"
-            : "NO_INTERRUPTION",
-          // Attached images are committed as atomic clientContent turns, so
-          // turnCoverage is a safety net for any realtime video frames (for
-          // example future webcam input) arriving just before the text that
-          // starts activity.
-          turnCoverage: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
-        }
+        ]
       }
     };
   }

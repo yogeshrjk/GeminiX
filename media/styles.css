@@ -473,10 +473,21 @@ button:disabled {
 .message.user .message-body {
   width: fit-content;
   max-width: 86%;
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
   padding: 7px 9px;
   border: 1px solid color-mix(in srgb, var(--panel-border) 70%, transparent);
   border-radius: 7px 7px 2px 7px;
   background: var(--chat-user-background);
+}
+
+.message.user .message-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  width: 100%;
 }
 
 .message.model .message-body {
@@ -533,6 +544,22 @@ button:disabled {
   white-space: normal;
 }
 
+/* Inline code styling - yellow bold */
+.message-content code:not(.code-block code) {
+  color: #e5c07b;
+  font-weight: 600;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+}
+
+body.vscode-light .message-content code:not(.code-block code) {
+  color: #9a6700;
+  background: var(--vscode-textCodeBlock-background, rgba(0, 0, 0, 0.06));
+}
+
 /* File references and external URLs from the model's answer. */
 .message-content a.file-link,
 .message-content a.external-link {
@@ -558,23 +585,43 @@ button:disabled {
   opacity: 0.65;
 }
 
-/* User question editing (fix mis-heard speech transcriptions). */
-.message.user {
-  flex-wrap: wrap;
-}
-
-.message-actions {
-  flex-basis: 100%;
+.message-footer {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
-  margin-top: 2px;
+  gap: 6px;
+  width: 100%;
+  margin-top: 4px;
+  padding-top: 2px;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 120ms ease;
 }
 
-.message.user:hover .message-actions,
-.message.user:focus-within .message-actions {
+.message:hover .message-footer,
+.message:focus-within .message-footer {
   opacity: 1;
+  pointer-events: auto;
+}
+
+.message-time {
+  color: var(--muted);
+  font-size: 10px;
+  opacity: 0.75;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.message-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 0;
+}
+
+/* User question editing (fix mis-heard speech transcriptions). */
+.message.user {
+  flex-wrap: wrap;
 }
 
 .message-action-button {
@@ -602,21 +649,32 @@ button:disabled {
   stroke: currentColor;
 }
 
+.message.user.is-editing {
+  width: 100%;
+}
+
+.message.user.is-editing .message-body {
+  width: 100%;
+  max-width: 100%;
+}
+
 .message-editor {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  width: 100%;
 }
 
 .message-edit-row {
   position: relative;
+  width: 100%;
 }
 
 .message-edit-input {
   box-sizing: border-box;
   width: 100%;
-  min-height: 56px;
-  padding: 6px 36px 6px 8px;
+  min-height: 80px;
+  padding: 8px 36px 8px 10px;
   border: 1px solid
     var(
       --vscode-input-border,
@@ -1135,6 +1193,11 @@ body.vscode-high-contrast .shiki span {
   border-radius: 4px;
 }
 
+.send-button svg.lucide {
+  fill: none;
+  stroke: currentColor;
+}
+
 .composer-hint {
   display: block;
   margin-top: 4px;
@@ -1205,6 +1268,14 @@ body.vscode-high-contrast .shiki span {
   );
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 9px;
+}
+
+.attachment-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 2px;
+  object-fit: cover;
+  flex: 0 0 auto;
 }
 
 .attachment-kind {
@@ -1279,12 +1350,24 @@ body.vscode-high-contrast .shiki span {
   margin-top: 6px;
 }
 
+.message.user .message-attachments {
+  justify-content: flex-end;
+  align-self: flex-end;
+  width: 100%;
+  margin-top: 0;
+  margin-bottom: 6px;
+}
+
 .message-attachment-image {
   max-width: 180px;
   max-height: 180px;
   border-radius: 6px;
   border: 1px solid var(--panel-border);
   object-fit: cover;
+}
+
+.message.user .message-attachment-image {
+  margin-left: auto;
 }
 
 .message-attachment-chip {
@@ -1302,6 +1385,10 @@ body.vscode-high-contrast .shiki span {
   font-size: 10px;
   max-width: 200px;
   overflow: hidden;
+}
+
+.message.user .message-attachment-chip {
+  margin-left: auto;
 }
 
 .message-attachment-chip-icon {
@@ -1378,7 +1465,7 @@ body.vscode-high-contrast .shiki span {
   align-items: center;
   gap: 7px;
   margin: 0 -12px 12px;
-  padding: 9px 10px;
+  padding: 9px 12px;
   border-bottom: 1px solid var(--panel-border);
   background: var(--vscode-sideBar-background);
 }
@@ -1436,6 +1523,13 @@ body.vscode-high-contrast .shiki span {
   display: inline-flex;
   flex: 0 0 auto;
   gap: 2px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.chat-history-row:hover .chat-history-actions,
+.chat-history-row:focus-within .chat-history-actions {
+  opacity: 1;
 }
 
 .danger-action:hover {

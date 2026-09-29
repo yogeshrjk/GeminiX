@@ -113,6 +113,111 @@ textarea:focus-visible {
   flex-direction: column;
 }
 
+#chatPanel.api-key-required .chat-scroll-region,
+#chatPanel.api-key-required .composer {
+  display: none;
+}
+
+.api-setup-screen {
+  display: none;
+  min-height: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 24px;
+}
+
+#chatPanel.api-key-required .api-setup-screen {
+  display: flex;
+}
+
+.api-setup-content {
+  width: min(100%, 380px);
+  margin: auto;
+}
+
+.api-setup-logo {
+  display: block;
+  width: 42px;
+  height: 42px;
+  object-fit: contain;
+}
+
+.api-setup-eyebrow {
+  margin: 24px 0 6px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.api-setup-content h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.api-setup-intro {
+  margin: 8px 0 22px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.api-setup-field input {
+  width: 100%;
+}
+
+.api-setup-submit {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.api-setup-security,
+.api-setup-feedback,
+.api-setup-free {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.api-setup-security {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.api-setup-feedback {
+  margin: 8px 0 0;
+  color: var(--danger);
+}
+
+.api-setup-divider {
+  height: 1px;
+  margin: 20px 0 14px;
+  background: var(--panel-border);
+}
+
+.api-setup-free {
+  margin: 0;
+  color: var(--muted);
+}
+
+.api-setup-free strong {
+  color: var(--vscode-foreground);
+  font-size: 12px;
+}
+
+.api-setup-link {
+  display: inline-block;
+  margin-top: 14px;
+  color: var(--accent);
+  line-height: 1.5;
+  text-decoration: none;
+}
+
+.api-setup-link:hover {
+  text-decoration: underline;
+}
+
 #settingsPanel.panel.is-active {
   display: block;
   overflow-y: auto;
@@ -642,6 +747,10 @@ body.vscode-light .message-content code:not(.code-block code) {
   color: var(--vscode-foreground);
 }
 
+.message-action-button.is-speaking {
+  color: var(--vscode-textLink-foreground, #3794ff);
+}
+
 .message-action-button svg {
   width: 12px;
   height: 12px;
@@ -745,6 +854,71 @@ body.vscode-light .message-content code:not(.code-block code) {
 
 .rendered-text {
   white-space: pre-wrap;
+}
+
+.svg-diagram-card {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  margin: 9px 0;
+  overflow: hidden;
+  border: 1px solid var(--vscode-editorWidget-border, var(--panel-border));
+  border-radius: 6px;
+  background: var(
+    --vscode-textCodeBlock-background,
+    var(--vscode-editor-background)
+  );
+  white-space: normal;
+}
+
+.svg-diagram-header {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 6px 4px 10px;
+  border-bottom: 1px solid var(--vscode-editorWidget-border, var(--panel-border));
+  background: color-mix(
+    in srgb,
+    var(--vscode-editor-background) 86%,
+    var(--vscode-foreground) 4%
+  );
+  color: var(--muted);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+}
+
+.svg-diagram-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+  color: var(--vscode-foreground);
+}
+
+.svg-diagram-preview {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 16px;
+  background: color-mix(
+    in srgb,
+    var(--vscode-editor-background) 95%,
+    var(--vscode-foreground) 2%
+  );
+  overflow-x: auto;
+}
+
+.rendered-svg-diagram {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+.rendered-svg-diagram text {
+  font-family: var(--vscode-font-family, system-ui, sans-serif);
 }
 
 .code-block {

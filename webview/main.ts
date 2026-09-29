@@ -28,6 +28,7 @@ import { createHighlighterCore } from "shiki/core";
 import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
 import {
   parseRichContent,
+  stripMarkdownForSpeech,
   unescapeMarkdownPipes,
   type TableAlignment,
   type TableSegment
@@ -190,6 +191,8 @@ interface HostMessage {
   readonly currentPage?: CurrentPageSummary;
   readonly payload?: unknown;
   readonly message?: string;
+  readonly codeText?: string;
+  readonly languageId?: string;
   readonly kind?: string;
   readonly hasImages?: boolean;
   readonly code?: number;
@@ -359,8 +362,6 @@ const elements = {
   chatHistoryList: requiredElement<HTMLElement>("chatHistoryList"),
   confirmBulkDeleteButton:
     requiredElement<HTMLButtonElement>("confirmBulkDeleteButton"),
-  configureApiButton:
-    requiredElement<HTMLButtonElement>("configureApiButton"),
   currentPageBar: requiredElement<HTMLElement>("currentPageBar"),
   currentPageLabel: requiredElement<HTMLElement>("currentPageLabel"),
   currentPageMention:
@@ -382,6 +383,11 @@ const elements = {
   newChatFromHistoryButton:
     requiredElement<HTMLButtonElement>("newChatFromHistoryButton"),
   removeApiButton: requiredElement<HTMLButtonElement>("removeApiButton"),
+  setupApiKeyInput:
+    requiredElement<HTMLInputElement>("setupApiKeyInput"),
+  setupApiFeedback: requiredElement<HTMLElement>("setupApiFeedback"),
+  setupSaveApiButton:
+    requiredElement<HTMLButtonElement>("setupSaveApiButton"),
   removeCurrentPageButton:
     requiredElement<HTMLButtonElement>("removeCurrentPageButton"),
   saveApiButton: requiredElement<HTMLButtonElement>("saveApiButton"),
@@ -470,6 +476,13 @@ const state = {
   timer: undefined as number | undefined,
   turns: 0,
   restoringChat: false,
+  isRespeaking: false,
+  respeakCancelled: false,
+  respeakTurnComplete: false,
+  activeRespeakText: "",
+  suppressRespeakTranscript: false,
+  activeRespeakButton: null as HTMLButtonElement | null,
+  pendingRespeak: undefined as string | undefined,
   debugEntries: [] as { time: string; message: string }[],
 };
 
@@ -496,6 +509,9 @@ function initializeSelects(): void {
 }
 
 function setActiveTab(tabName: "chat" | "history" | "settings"): void {
+  if (!state.apiConfigured && tabName !== "chat") {
+    tabName = "chat";
+  }
   if (tabName !== "history" && state.bulkDeleteMode) {
     setBulkDeleteMode(false);
   }
@@ -553,6 +569,7 @@ function clearError(): void {
 
 function updateApiStatus(configured: boolean): void {
   state.apiConfigured = configured;
+  elements.chatPanel.classList.toggle("api-key-required", !configured);
   elements.apiRequiredCard.classList.toggle("hidden", configured);
   elements.apiStatusDot.classList.toggle("is-configured", configured);
   elements.apiStatusText.textContent = configured
@@ -561,6 +578,25 @@ function updateApiStatus(configured: boolean): void {
   elements.apiKeyField.classList.toggle("hidden", configured);
   elements.saveApiButton.classList.toggle("hidden", configured);
   elements.removeApiButton.classList.toggle("hidden", !configured);
+  if (!configured) {
+    setActiveTab("chat");
+  }
+}
+
+function submitApiKey(
+  input: HTMLInputElement,
+  feedback: HTMLElement
+): void {
+  const apiKey = input.value.trim();
+  if (!apiKey) {
+    feedback.textContent = "Enter a Gemini API key before saving.";
+    feedback.classList.remove("hidden");
+    input.focus();
+    return;
+  }
+
+  feedback.classList.add("hidden");
+  vscode.postMessage({ type: "saveApiKey", value: apiKey });
 }
 
 function applyPreferences(preferences: Preferences): void {
@@ -1063,6 +1099,16 @@ function createMessage(
     footer.append(timeSpan, actions);
     wrapper.append(footer);
   } else {
+    const respeakButton = document.createElement("button");
+    respeakButton.type = "button";
+    respeakButton.className = "message-action-button";
+    respeakButton.title = "Read response aloud";
+    respeakButton.setAttribute("aria-label", "Read response aloud");
+    respeakButton.innerHTML = lucideIconSvg("volume-2", 12);
+    respeakButton.addEventListener("click", () => {
+      respeakModelMessage(message, respeakButton);
+    });
+
     const copyButton = document.createElement("button");
     copyButton.type = "button";
     copyButton.className = "message-action-button";
@@ -1083,7 +1129,7 @@ function createMessage(
       shareModelMessage(message, shareButton);
     });
 
-    actions.append(copyButton, shareButton);
+    actions.append(respeakButton, copyButton, shareButton);
     footer.append(timeSpan, actions);
     body.append(footer);
   }
@@ -1168,6 +1214,84 @@ function shareModelMessage(
   }, 1_200);
 }
 
+function resetRespeakButton(): void {
+  if (state.activeRespeakButton) {
+    state.activeRespeakButton.classList.remove("is-speaking");
+    state.activeRespeakButton.innerHTML = lucideIconSvg("volume-2", 12);
+    state.activeRespeakButton.title = "Read response aloud";
+    state.activeRespeakButton.setAttribute("aria-label", "Read response aloud");
+    state.activeRespeakButton = null;
+  }
+}
+
+function respeakModelMessage(
+  message: TranscriptMessage,
+  button: HTMLButtonElement
+): void {
+  if (state.isRespeaking && state.activeRespeakButton === button) {
+    state.respeakCancelled = true;
+    state.pendingRespeak = undefined;
+    stopPlayback();
+    state.suppressNextResponse = true;
+    state.isRespeaking = false;
+    resetRespeakButton();
+    hideActivityIndicator();
+    vscode.postMessage({ type: "interruptTurn" });
+    setStatus(
+      state.audioMuted ? "Voice muted" : "Listening",
+      state.audioMuted ? "idle" : "live"
+    );
+    return;
+  }
+
+  if (
+    state.isProcessing ||
+    state.playbackSources.size > 0 ||
+    state.isRespeaking
+  ) {
+    stopPlayback();
+    vscode.postMessage({ type: "interruptTurn" });
+  }
+
+  resetRespeakButton();
+
+  const text =
+    message.spokenText.trim() ||
+    stripMarkdownForSpeech(getModelMessageFullText(message));
+  if (!text) {
+    return;
+  }
+
+  if (!state.apiConfigured) {
+    setActiveTab("chat");
+    elements.setupApiKeyInput.focus();
+    return;
+  }
+
+  state.isRespeaking = true;
+  state.respeakCancelled = false;
+  state.respeakTurnComplete = false;
+  state.activeRespeakText = text;
+  state.suppressRespeakTranscript = true;
+  state.activeRespeakButton = button;
+  state.suppressNextResponse = false;
+  button.classList.add("is-speaking");
+  button.innerHTML = lucideIconSvg("volume-x", 12);
+  button.title = "Stop reading aloud";
+  button.setAttribute("aria-label", "Stop reading aloud");
+
+  if (!state.sessionReady) {
+    state.pendingRespeak = text;
+    void beginSession();
+    return;
+  }
+
+  vscode.postMessage({
+    type: "respeakMessage",
+    text
+  });
+}
+
 function regenerateUserMessage(message: TranscriptMessage): void {
   const question = message.spokenText.trim();
   if (!question) {
@@ -1175,6 +1299,9 @@ function regenerateUserMessage(message: TranscriptMessage): void {
   }
 
   state.suppressNextResponse = false;
+  state.respeakCancelled = false;
+  state.activeRespeakText = "";
+  state.suppressRespeakTranscript = false;
   clearError();
   const requestId = crypto.randomUUID();
   const chatId = ensureActiveChat(question);
@@ -1348,6 +1475,9 @@ function sendCorrectedQuestion(text: string): void {
   }
 
   state.suppressNextResponse = false;
+  state.respeakCancelled = false;
+  state.activeRespeakText = "";
+  state.suppressRespeakTranscript = false;
   clearError();
   const requestId = crypto.randomUUID();
   const chatId = ensureActiveChat(trimmed);
@@ -1665,6 +1795,7 @@ function normalizeSpokenUrls(text: string): string {
 
 const SPURIOUS_VOICE_UTTERANCES = new Set([
   "sí",
+  "sí.",
   "si",
   "yes",
   "yeah",
@@ -1689,6 +1820,18 @@ function isSpuriousVoiceInput(text: string): boolean {
     .replace(/[.,/#!$%^&*;:{}=\-_`~()?"'।]/gu, "")
     .trim();
   return SPURIOUS_VOICE_UTTERANCES.has(normalized);
+}
+
+function isActiveRespeakEcho(text: string): boolean {
+  const normalize = (value: string): string =>
+    value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const input = normalize(text);
+  const respeak = normalize(state.activeRespeakText);
+  return (
+    input.length >= 12 &&
+    respeak.length >= 12 &&
+    (input.includes(respeak) || respeak.includes(input))
+  );
 }
 
 function buildFileLinkHtml(
@@ -1981,7 +2124,80 @@ function normalizedLanguage(language: string): string {
   return aliases[language.toLowerCase()] ?? language.toLowerCase();
 }
 
-async function appendCodeBlock(
+function renderSvgDiagram(svgText: string): HTMLElement | null {
+  try {
+    const start = svgText.search(/<svg[\s>]/i);
+    const end = svgText.toLowerCase().lastIndexOf("</svg>");
+    if (start === -1 || end === -1 || end < start) {
+      return null;
+    }
+    const rawSvg = svgText.slice(start, end + 6);
+
+    const parser = new DOMParser();
+    let svgEl: Element | null = null;
+
+    try {
+      const xmlDoc = parser.parseFromString(rawSvg, "image/svg+xml");
+      if (!xmlDoc.querySelector("parsererror")) {
+        svgEl = xmlDoc.querySelector("svg");
+      }
+    } catch {
+      // Ignore XML parsing error and fall back to HTML5 parsing
+    }
+
+    if (!svgEl) {
+      const cleanSvg = rawSvg
+        .replace(/<br\s*\/?>/gi, "<br/>")
+        .replace(/&(?!(?:[a-zA-Z0-9]+|#\d+|#x[0-9a-fA-F]+);)/g, "&amp;");
+      try {
+        const htmlDoc = parser.parseFromString(cleanSvg, "text/html");
+        svgEl = htmlDoc.querySelector("svg");
+      } catch {
+        // Ignore HTML5 parsing error
+      }
+    }
+
+    if (!svgEl) {
+      return null;
+    }
+
+    if (!svgEl.getAttribute("xmlns")) {
+      svgEl.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    }
+
+    if (!svgEl.getAttribute("viewBox")) {
+      const widthAttr = svgEl.getAttribute("width");
+      const heightAttr = svgEl.getAttribute("height");
+      const widthNum = widthAttr ? parseFloat(widthAttr) : NaN;
+      const heightNum = heightAttr ? parseFloat(heightAttr) : NaN;
+      if (
+        !Number.isNaN(widthNum) &&
+        !Number.isNaN(heightNum) &&
+        widthNum > 0 &&
+        heightNum > 0
+      ) {
+        svgEl.setAttribute("viewBox", `0 0 ${widthNum} ${heightNum}`);
+      } else {
+        svgEl.setAttribute("viewBox", "0 0 800 500");
+      }
+    }
+
+    svgEl.setAttribute("width", "100%");
+    svgEl.setAttribute("height", "auto");
+    svgEl.classList.add("rendered-svg-diagram");
+
+    svgEl.querySelectorAll("script").forEach((el) => el.remove());
+
+    const container = document.createElement("div");
+    container.className = "svg-diagram-preview";
+    container.append(document.importNode(svgEl, true));
+    return container;
+  } catch {
+    return null;
+  }
+}
+
+async function renderStandardCodeBlock(
   container: HTMLElement,
   languageLabel: string,
   codeText: string,
@@ -2042,6 +2258,91 @@ async function appendCodeBlock(
   pre.append(code);
   block.append(header, pre);
   container.append(block);
+}
+
+async function appendCodeBlock(
+  container: HTMLElement,
+  languageLabel: string,
+  codeText: string,
+  applyTargetId: string | undefined,
+  closed = true
+): Promise<void> {
+  const lang = languageLabel.trim().toLowerCase();
+  const trimmedCode = codeText.trim();
+  const isSvg =
+    lang === "svg" ||
+    lang === "diagram" ||
+    lang === "flowchart" ||
+    lang === "xml" ||
+    lang === "html" ||
+    (/<svg[\s>]/i.test(trimmedCode) && /<\/svg>/i.test(trimmedCode));
+
+  if (isSvg) {
+    const svgPreview = renderSvgDiagram(trimmedCode);
+    if (svgPreview) {
+      const card = document.createElement("section");
+      card.className = "svg-diagram-card";
+
+      const header = document.createElement("div");
+      header.className = "svg-diagram-header";
+
+      const title = document.createElement("span");
+      title.className = "svg-diagram-title";
+      title.textContent = "Diagram";
+
+      const actions = document.createElement("span");
+      actions.className = "code-actions";
+
+      const toggleButton = document.createElement("button");
+      toggleButton.className = "code-action-button";
+      toggleButton.type = "button";
+      toggleButton.title = "View raw SVG code";
+      toggleButton.setAttribute("aria-label", "View raw SVG code");
+      toggleButton.innerHTML = lucideIconSvg("pencil", 12);
+
+      actions.append(toggleButton);
+      actions.append(createCodeActionButton("copy", codeText));
+      header.append(title, actions);
+
+      card.append(header);
+      card.append(svgPreview);
+
+      const codeContainer = document.createElement("div");
+      codeContainer.className = "svg-code-container hidden";
+      card.append(codeContainer);
+
+      let codeRendered = false;
+      toggleButton.addEventListener("click", () => {
+        const isHidden = codeContainer.classList.contains("hidden");
+        if (isHidden && !codeRendered) {
+          codeRendered = true;
+          void renderStandardCodeBlock(
+            codeContainer,
+            "xml",
+            codeText,
+            applyTargetId,
+            closed
+          );
+        }
+        codeContainer.classList.toggle("hidden", !isHidden);
+        svgPreview.classList.toggle("hidden", isHidden);
+        toggleButton.title = isHidden
+          ? "View Diagram Preview"
+          : "View raw SVG code";
+      });
+
+      container.append(card);
+      return;
+    }
+  }
+
+  await renderStandardCodeBlock(
+    container,
+    languageLabel,
+    codeText,
+    applyTargetId,
+    closed
+  );
 }
 
 function createCodeActionButton(
@@ -2211,6 +2512,11 @@ function finalizeModelMessage(): void {
 }
 
 function resetTranscriptView(): void {
+  if (state.isRespeaking) {
+    state.isRespeaking = false;
+    resetRespeakButton();
+  }
+  state.pendingRespeak = undefined;
   elements.transcript
     .querySelectorAll<HTMLElement>(".message, .activity-indicator")
     .forEach((message) => {
@@ -2219,6 +2525,7 @@ function resetTranscriptView(): void {
   state.currentModelMessage = undefined;
   state.currentUserMessage = undefined;
   state.pendingVoiceContext = undefined;
+  state.suppressRespeakTranscript = false;
   state.pendingModelApplyTargetId = undefined;
   state.activeSearches = 0;
   state.analyzingImage = false;
@@ -2471,6 +2778,10 @@ function base64ToBytes(base64: string): Uint8Array {
 }
 
 function stopPlayback(): void {
+  if (state.isRespeaking) {
+    state.isRespeaking = false;
+    resetRespeakButton();
+  }
   state.playbackSources.forEach((source) => {
     try {
       source.stop();
@@ -2527,6 +2838,11 @@ function queueOutputAudio(base64: string): void {
       state.sessionReady &&
       !state.audioMuted
     ) {
+      if (state.isRespeaking && state.respeakTurnComplete) {
+        state.isRespeaking = false;
+        resetRespeakButton();
+        hideActivityIndicator();
+      }
       setStatus("Listening", "live");
     }
   };
@@ -2568,8 +2884,8 @@ async function beginSession(): Promise<void> {
     return;
   }
   if (!state.apiConfigured) {
-    setActiveTab("settings");
-    elements.apiKeyInput.focus();
+    setActiveTab("chat");
+    elements.setupApiKeyInput.focus();
     return;
   }
   clearError();
@@ -2679,9 +2995,12 @@ function submitTextMessage(): void {
   if (!hasContent || state.pendingTextSubmission) {
     return;
   }
+  state.respeakCancelled = false;
+  state.activeRespeakText = "";
+  state.suppressRespeakTranscript = false;
   if (!state.apiConfigured) {
-    setActiveTab("settings");
-    elements.apiKeyInput.focus();
+    setActiveTab("chat");
+    elements.setupApiKeyInput.focus();
     return;
   }
 
@@ -2766,6 +3085,11 @@ function endSession(): void {
   state.sessionReady = false;
   state.suppressNextResponse = false;
   state.micMuted = false;
+  if (state.isRespeaking) {
+    state.isRespeaking = false;
+    resetRespeakButton();
+  }
+  state.pendingRespeak = undefined;
   resetScreenSharing();
   elements.muteMicButton.classList.remove("is-muted");
   elements.muteMicButton.title = "Mute microphone";
@@ -2804,6 +3128,13 @@ function handleServerMessage(payload: unknown): void {
     startTimer();
     updateControls();
     setStatus("Listening", "live");
+    if (state.pendingRespeak) {
+      vscode.postMessage({
+        type: "respeakMessage",
+        text: state.pendingRespeak
+      });
+      state.pendingRespeak = undefined;
+    }
     if (state.pendingTextSubmission) {
       dispatchTextSubmission(state.pendingTextSubmission);
     }
@@ -2818,13 +3149,30 @@ function handleServerMessage(payload: unknown): void {
     // question starts a fresh transcript bubble instead of merging into the
     // previous one.
     if (content.interrupted) {
+      if (state.isRespeaking) {
+        state.isRespeaking = false;
+        resetRespeakButton();
+      }
       finishTranscriptTurn();
       endProcessing();
     }
 
     // When the user speaks (voice input) after a stop, clear suppression.
     const userText = content.inputTranscription?.text;
-    if (userText && !isSpuriousVoiceInput(userText)) {
+    if (userText && isSpuriousVoiceInput(userText)) {
+      state.suppressNextResponse = true;
+      stopPlayback();
+      vscode.postMessage({ type: "interruptTurn" });
+    } else if (userText && isActiveRespeakEcho(userText)) {
+      state.pendingVoiceContext = undefined;
+    } else if (userText) {
+      state.respeakCancelled = false;
+      if (state.isRespeaking) {
+        state.isRespeaking = false;
+        resetRespeakButton();
+      }
+      state.activeRespeakText = "";
+      state.suppressRespeakTranscript = false;
       state.suppressNextResponse = false;
       ensureActiveChat(userText);
       // A new spoken turn begins here — finalize any partial model answer
@@ -2849,7 +3197,9 @@ function handleServerMessage(payload: unknown): void {
       // When in suppressed mode, skip this response entirely.
       if (!state.suppressNextResponse) {
         markAnswering();
-        appendSpokenTranscript(spokenText);
+        if (!state.suppressRespeakTranscript) {
+          appendSpokenTranscript(spokenText);
+        }
       }
     }
 
@@ -2866,7 +3216,7 @@ function handleServerMessage(payload: unknown): void {
         (part.inlineData.mimeType ?? "audio/pcm").startsWith("audio/pcm")
       ) {
         // Only queue audio if we are not suppressing this response.
-        if (!state.suppressNextResponse) {
+        if (!state.suppressNextResponse && !state.respeakCancelled) {
           markAnswering();
           queueOutputAudio(part.inlineData.data);
         }
@@ -2875,7 +3225,9 @@ function handleServerMessage(payload: unknown): void {
       // these streams breaks Markdown fences when their chunks interleave.
       if (part.text && !state.suppressNextResponse) {
         markAnswering();
-        appendVisualText(part.text);
+        if (!state.suppressRespeakTranscript) {
+          appendVisualText(part.text);
+        }
       }
     }
 
@@ -2887,7 +3239,15 @@ function handleServerMessage(payload: unknown): void {
 
     if (content.turnComplete) {
       hideActivityIndicator();
-      finishTranscriptTurn();
+      if (state.isRespeaking) {
+        state.respeakTurnComplete = true;
+        if (!state.playbackSources.size) {
+          state.isRespeaking = false;
+          resetRespeakButton();
+        }
+      } else {
+        finishTranscriptTurn();
+      }
       endProcessing();
       if (!state.playbackSources.size) {
         setStatus("Listening", "live");
@@ -3134,6 +3494,9 @@ function handleHostMessage(message: HostMessage): void {
   switch (message.type) {
     case "initialState":
       updateApiStatus(Boolean(message.apiConfigured));
+      if (!message.apiConfigured) {
+        elements.setupApiKeyInput.focus();
+      }
       if (message.preferences) {
         applyPreferences(message.preferences);
       }
@@ -3146,6 +3509,8 @@ function handleHostMessage(message: HostMessage): void {
     case "apiStatus":
       updateApiStatus(Boolean(message.configured));
       elements.apiKeyInput.value = "";
+      elements.setupApiKeyInput.value = "";
+      elements.setupApiFeedback.classList.add("hidden");
       elements.settingsFeedback.textContent = message.configured
         ? "API key saved securely."
         : "API key removed.";
@@ -3157,8 +3522,8 @@ function handleHostMessage(message: HostMessage): void {
       resetScreenSharing();
       cleanupAudio();
       updateControls();
-      setActiveTab("settings");
-      elements.apiKeyInput.focus();
+      setActiveTab("chat");
+      elements.setupApiKeyInput.focus();
       break;
     case "openPanel":
       if (message.panel === "history" || message.panel === "settings") {
@@ -3224,6 +3589,24 @@ function handleHostMessage(message: HostMessage): void {
     case "serverMessage":
       handleServerMessage(message.payload);
       break;
+    case "selectedCodeResponse":
+      if (message.codeText) {
+        const language = message.languageId ?? "text";
+        let fence = "```";
+        while (message.codeText.includes(fence)) {
+          fence += "`";
+        }
+        appendVisualText(
+          `${fence}${language}\n${message.codeText}\n${fence}`
+        );
+        finishTranscriptTurn();
+      }
+      hideActivityIndicator();
+      endProcessing();
+      if (state.sessionReady) {
+        setStatus("Listening", "live");
+      }
+      break;
     case "debugLog":
       if (message.message) {
         pushDebugLog(message.message);
@@ -3245,6 +3628,7 @@ function handleHostMessage(message: HostMessage): void {
       break;
     case "sessionError":
       state.pendingTextSubmission = undefined;
+      state.pendingRespeak = undefined;
       state.isConnecting = false;
       state.sessionReady = false;
       state.micMuted = false;
@@ -3266,6 +3650,7 @@ function handleHostMessage(message: HostMessage): void {
       break;
     case "sessionClosed":
       state.pendingTextSubmission = undefined;
+      state.pendingRespeak = undefined;
       state.isConnecting = false;
       state.sessionReady = false;
       state.micMuted = false;
@@ -3306,6 +3691,7 @@ function handleHostMessage(message: HostMessage): void {
       break;
     case "sessionStopped":
       state.pendingTextSubmission = undefined;
+      state.pendingRespeak = undefined;
       state.isConnecting = false;
       state.sessionReady = false;
       state.micMuted = false;
@@ -3613,11 +3999,6 @@ elements.cancelBulkDeleteButton.addEventListener("click", () => {
   setBulkDeleteMode(false);
 });
 
-elements.configureApiButton.addEventListener("click", () => {
-  setActiveTab("settings");
-  elements.apiKeyInput.focus();
-});
-
 elements.sessionButton.addEventListener("click", () => {
   if (state.sessionReady || state.isConnecting) {
     endSession();
@@ -3701,16 +4082,18 @@ elements.stopPlaybackButton.addEventListener("click", () => {
 });
 
 elements.saveApiButton.addEventListener("click", () => {
-  const apiKey = elements.apiKeyInput.value.trim();
-  if (!apiKey) {
-    elements.settingsFeedback.textContent =
-      "Enter a Gemini API key before saving.";
-    elements.settingsFeedback.classList.remove("hidden");
-    return;
-  }
+  submitApiKey(elements.apiKeyInput, elements.settingsFeedback);
+});
 
-  elements.settingsFeedback.classList.add("hidden");
-  vscode.postMessage({ type: "saveApiKey", value: apiKey });
+elements.setupSaveApiButton.addEventListener("click", () => {
+  submitApiKey(elements.setupApiKeyInput, elements.setupApiFeedback);
+});
+
+elements.setupApiKeyInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    submitApiKey(elements.setupApiKeyInput, elements.setupApiFeedback);
+  }
 });
 
 elements.removeApiButton.addEventListener("click", () => {

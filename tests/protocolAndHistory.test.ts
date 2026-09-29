@@ -8,7 +8,86 @@ import {
   createToolResponsePayload,
   isLiveFunctionResponse
 } from "../src/liveProtocol.ts";
+import {
+  buildConversationHistoryPrompt,
+  buildSystemInstruction
+} from "../src/prompts.ts";
+import { isDirectSelectedCodeRequest } from "../src/requestIntent.ts";
 import { shouldInterruptPlayback } from "../webview/playbackPolicy.ts";
+
+void test("asks for clarification instead of inventing intent from a fragment", () => {
+  const instruction = buildSystemInstruction({
+    voice: "Kore",
+    preferredLanguage: "English",
+    autoInterrupt: true,
+    behavior: "professional"
+  });
+
+  assert.match(instruction, /current user message is the request to answer/u);
+  assert.match(instruction, /isolated letter, short fragment/u);
+  assert.match(instruction, /do not search the web/u);
+  assert.match(instruction, /prior assistant claim/u);
+});
+
+void test("requires complete requested JSON to be rendered instead of described", () => {
+  const instruction = buildSystemInstruction({
+    voice: "Kore",
+    preferredLanguage: "English",
+    autoInterrupt: true,
+    behavior: "professional"
+  });
+
+  assert.match(instruction, /MUST call `render_markdown` with the full artifact/u);
+  assert.match(instruction, /statement that the artifact is 'below' is not a substitute/u);
+  assert.match(instruction, /complete JSON in a fenced `json` code block/u);
+  assert.match(instruction, /do not invent data or pretend it was rendered/u);
+});
+
+void test("mandates calling render_markdown for coding and implementation questions", () => {
+  const instruction = buildSystemInstruction({
+    voice: "Kore",
+    preferredLanguage: "English",
+    autoInterrupt: true,
+    behavior: "professional"
+  });
+
+  assert.match(instruction, /MANDATORY FOR ALL CODE AND STRUCTURED CONTENT/u);
+  assert.match(instruction, /how to write a program/u);
+  assert.match(instruction, /MUST call `render_markdown` with the full working code in a fenced code block/u);
+  assert.match(instruction, /NO GHOST VISUAL REFERENCES/u);
+});
+
+void test("recognizes direct selected-code requests without intercepting explanations", () => {
+  assert.equal(
+    isDirectSelectedCodeRequest("extension.ts 289-314 give me the code"),
+    true
+  );
+  assert.equal(isDirectSelectedCodeRequest("show me the selected snippet"), true);
+  assert.equal(isDirectSelectedCodeRequest("explain the selected code"), false);
+  assert.equal(isDirectSelectedCodeRequest("give me the data as JSON"), false);
+});
+
+void test("marks restored history as context and distinguishes assistant replies", () => {
+  const history = buildConversationHistoryPrompt([
+    {
+      id: "user-1",
+      role: "user",
+      spokenText: "G",
+      createdAt: "2026-09-29T00:00:00.000Z"
+    },
+    {
+      id: "model-1",
+      role: "model",
+      spokenText: "Node.js is currently version ...",
+      createdAt: "2026-09-29T00:00:01.000Z"
+    }
+  ]);
+
+  assert.match(history, /history is context, not a new request/u);
+  assert.match(history, /never attribute an assistant claim to the user/u);
+  assert.match(history, /User: G/u);
+  assert.match(history, /GeminiX: Node\.js/u);
+});
 
 void test("formats the Gemini Live tool-response payload with matching IDs", () => {
   const response = {

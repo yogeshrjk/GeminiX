@@ -438,14 +438,14 @@ export class LiveSession {
               {
                 name: "render_markdown",
                 description:
-                  "Render code, Markdown tables, lists, headings, and detailed visual technical content in the chat panel.",
+                  "Render code, Markdown tables, lists, headings, and detailed visual technical content in the chat panel. REQUIRED whenever providing code snippets, examples, programming solutions, JSON, tables, or structured explanations. You must call this tool with complete, runnable code in fenced code blocks whenever answering programming or implementation questions.",
                 parameters: {
                   type: "OBJECT",
                   properties: {
                     markdown: {
                       type: "STRING",
                       description:
-                        "Complete Markdown content. Code must use fenced code blocks."
+                        "The complete Markdown content including fenced code blocks (e.g. ```python), headings, explanations, or JSON to display in the chat panel."
                     }
                   },
                   required: ["markdown"]

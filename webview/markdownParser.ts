@@ -29,6 +29,8 @@ interface ParsedRow {
 const OPENING_FENCE_PATTERN = /^```([A-Za-z0-9_+#.-]*)[ \t]*$/u;
 const CLOSING_FENCE_PATTERN = /^```[ \t]*$/u;
 const SEPARATOR_CELL_PATTERN = /^:?-+:?$/u;
+const RAW_SVG_OPEN_PATTERN = /^\s*<svg(?:\s|>|\/|$)/iu;
+const RAW_SVG_CLOSE_PATTERN = /<\/svg>/iu;
 
 export function parseRichContent(source: string): readonly RichContentSegment[] {
   if (!source) {
@@ -79,6 +81,39 @@ export function parseRichContent(source: string): readonly RichContentSegment[] 
         code: codeLines.join("\n"),
         closed
       });
+      continue;
+    }
+
+    if (RAW_SVG_OPEN_PATTERN.test(line)) {
+      flushText();
+      const codeLines: string[] = [line];
+      let closed = false;
+
+      if (RAW_SVG_CLOSE_PATTERN.test(line)) {
+        closed = true;
+        lineIndex += 1;
+      } else {
+        lineIndex += 1;
+        while (lineIndex < lines.length) {
+          const codeLine = lines[lineIndex] ?? "";
+          codeLines.push(codeLine);
+          if (RAW_SVG_CLOSE_PATTERN.test(codeLine)) {
+            closed = true;
+            lineIndex += 1;
+            break;
+          }
+          lineIndex += 1;
+        }
+      }
+
+      const svgCode = codeLines.join("\n");
+      const svgSegment: CodeSegment = {
+        type: "code",
+        language: "svg",
+        code: svgCode,
+        closed
+      };
+      segments.push(svgSegment);
       continue;
     }
 
@@ -222,4 +257,47 @@ function readAlignment(separatorCell: string): TableAlignment {
     return "right";
   }
   return "left";
+}
+
+export function stripMarkdownForSpeech(text: string): string {
+  if (!text) {
+    return "";
+  }
+
+  return (
+    text
+      // Remove fenced code blocks
+      .replace(/```[\s\S]*?```/gu, "")
+      // Remove raw SVG blocks
+      .replace(/<svg[\s\S]*?<\/svg>/giu, "")
+      // Remove inline code backticks while preserving the code text
+      .replace(/`([^`]+)`/gu, "$1")
+      // Remove any remaining stray backticks
+      .replace(/`/gu, "")
+      // Remove markdown images: ![alt](url) -> ""
+      .replace(/!\[[^\]]*\]\([^)]*\)/gu, "")
+      // Convert markdown links: [text](url) -> text
+      .replace(/\[([^\]]+)\]\([^)]*\)/gu, "$1")
+      // Remove header markers: #, ##, etc. at start of line
+      .replace(/^#{1,6}\s+/gmu, "")
+      // Remove bold/italic formatting
+      .replace(/(\*\*|__)(.*?)\1/gu, "$2")
+      .replace(/(\*|_)(.*?)\1/gu, "$2")
+      .replace(/~~(.*?)~~/gu, "$1")
+      // Remove blockquotes: > quote
+      .replace(/^[ \t]*>[ \t]*/gmu, "")
+      // Remove bullet lists: - item, * item, + item
+      .replace(/^[ \t]*[-*+][ \t]+/gmu, "")
+      // Remove numbered lists: 1. item, 2. item
+      .replace(/^[ \t]*\d+\.[ \t]+/gmu, "")
+      // Remove horizontal rules
+      .replace(/^[ \t]*[-*_]{3,}[ \t]*$/gmu, "")
+      // Remove HTML tags
+      .replace(/<[^>]+>/gu, "")
+      // Collapse multiple newlines into max two
+      .replace(/\n{3,}/gu, "\n\n")
+      // Collapse extra spaces
+      .replace(/[ \t]+/gu, " ")
+      .trim()
+  );
 }

@@ -22,6 +22,7 @@ import {
   buildWorkspaceContextPrompt,
 } from "./prompts.js";
 import { readPreferences, savePreferences } from "./preferences.js";
+import { isDirectSelectedCodeRequest } from "./requestIntent.js";
 import type { EditorContext, Preferences, StoredChat } from "./types.js";
 import { WorkspaceContextRetriever } from "./workspaceContext.js";
 
@@ -31,6 +32,7 @@ const VIEW_ID = "liveline.chatView";
 interface WebviewMessage {
   readonly type: string;
   readonly value?: string;
+  readonly text?: string;
   readonly url?: string;
   readonly muted?: boolean;
   readonly requestId?: string;
@@ -215,6 +217,22 @@ class GeminiXViewProvider
     }
   }
 
+  private handleRespeakMessage(text: string | undefined): void {
+    const speechText = text?.trim();
+    if (!speechText || !this.session?.isConnected) {
+      return;
+    }
+
+    const prompt = [
+      "Please speak the following text aloud verbatim, loud and clear.",
+      "Provide spoken audio only. Do not add any introductory phrases, extra commentary, markdown blocks, or code blocks. Speak the text directly:",
+      "",
+      speechText,
+    ].join("\n");
+
+    this.session.sendUserTurn(prompt);
+  }
+
   public constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly secrets: vscode.SecretStorage,
@@ -250,10 +268,11 @@ class GeminiXViewProvider
   public resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
     const distributionUri = vscode.Uri.joinPath(this.extensionUri, "dist");
+    const mediaUri = vscode.Uri.joinPath(this.extensionUri, "media");
 
     view.webview.options = {
       enableScripts: true,
-      localResourceRoots: [distributionUri],
+      localResourceRoots: [distributionUri, mediaUri],
     };
     view.webview.html = this.getHtml(view.webview);
 
@@ -397,6 +416,9 @@ class GeminiXViewProvider
           break;
         case "shareResponse":
           await this.shareResponse(message.value);
+          break;
+        case "respeakMessage":
+          this.handleRespeakMessage(message.text);
           break;
       }
     } catch (error) {
@@ -614,6 +636,20 @@ class GeminiXViewProvider
     }
 
     const context = captureEditorContext();
+    if (
+      context &&
+      !hasAttachments &&
+      !fromEdit &&
+      isDirectSelectedCodeRequest(userText)
+    ) {
+      this.post({
+        type: "selectedCodeResponse",
+        codeText: context.text,
+        languageId: context.languageId
+      });
+      return;
+    }
+
     const currentPageContext = includeCurrentPage
       ? captureCurrentPageContext(currentPageUri)
       : undefined;
@@ -1315,6 +1351,9 @@ class GeminiXViewProvider
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "styles.css"),
     );
+    const logoUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, "media", "gemini-x.png"),
+    );
 
     return `<!doctype html>
 <html lang="en">
@@ -1328,14 +1367,26 @@ class GeminiXViewProvider
 <body>
   <div class="app-shell">
     <main class="app-main">
-      <section id="chatPanel" class="panel is-active" aria-label="Chat">
-        <div class="chat-scroll-region">
-          <div id="apiRequiredCard" class="notice-card hidden">
-            <strong>Connect Gemini to begin</strong>
-            <p>Add your Gemini API key in settings to start a live code conversation.</p>
-            <button id="configureApiButton" class="secondary-button" type="button">Open settings</button>
+      <section id="chatPanel" class="panel is-active api-key-required" aria-label="Chat">
+        <section id="apiRequiredCard" class="api-setup-screen" aria-labelledby="apiSetupTitle">
+          <div class="api-setup-content">
+            <img class="api-setup-logo" src="${logoUri.toString()}" alt="GeminiX">
+            <p class="api-setup-eyebrow">One-time setup</p>
+            <h1 id="apiSetupTitle">Connect Gemini</h1>
+            <p class="api-setup-intro">Add a Gemini API key to start asking questions about your code.</p>
+            <label class="field api-setup-field" for="setupApiKeyInput">
+              <span>Gemini API key</span>
+              <input id="setupApiKeyInput" type="password" spellcheck="false" autocomplete="off" placeholder="Paste your API key">
+            </label>
+            <button id="setupSaveApiButton" class="primary-button api-setup-submit" type="button">Save key and continue</button>
+            <p id="setupApiFeedback" class="api-setup-feedback hidden" role="alert"></p>
+            <p class="api-setup-security">Your key is stored securely in the operating system keychain.</p>
+            <div class="api-setup-divider" aria-hidden="true"></div>
+            <p class="api-setup-free"><strong>Completely free</strong><br>GeminiX is free to use. Google AI Studio API access is subject to Google's quotas and terms.</p>
+            <a class="api-setup-link external-link" href="https://aistudio.google.com/app/apikey">Get a free API key from Google AI Studio <span aria-hidden="true">↗</span></a>
           </div>
-
+        </section>
+        <div class="chat-scroll-region">
           <section id="voiceStage" class="voice-stage">
             <div class="status-line">
               <span class="status-left">

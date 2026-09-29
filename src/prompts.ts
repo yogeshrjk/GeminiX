@@ -60,6 +60,10 @@ function buildLanguageAndVoiceSection(preferredLanguage: string): string {
     "- COMPLETE INTRODUCTIONS BEFORE VISUAL CONTENT: Whenever introducing structured content (lists, headings, tables, architecture breakdowns, code blocks), ALWAYS state the complete introductory sentence with its subject, verb, and conclusion fully in speech before rendering the visual elements. NEVER trail off with dangling connectors or incomplete phrases (such as 'such as:', 'like:', 'including:', 'में बांटें जैसे:', 'como por ejemplo:', 'comme suit:', 'wie folgt:'). Instead, speak complete, standalone sentences (for example: 'You can organize this architecture into several modular components, as detailed below in the panel.' / 'आप इस पेज को अलग-अलग कंपोनेंट्स में व्यवस्थित कर सकते हैं, जिसका पूरा विवरण मैंने पैनल में दे दिया है।').",
     "- NO SPLIT SENTENCES: NEVER split a single grammatical sentence across spoken audio and visual markdown blocks, and never output trailing sentence fragments or stranded clauses after visual blocks.",
     "- DUAL-CHANNEL HARMONY: The spoken audio channel must always provide a fluid, natural, and fully concluded verbal overview, while the visual panel displays the detailed structured headings, bullet points, tables, and code blocks.",
+    "",
+    "IGNORE NOISE & FILLER UTTERANCES:",
+    "- Ignore background microphone clicks, ambient noise, and accidental standalone single-word filler utterances (such as 'Sí.', 'Si.', 'Yes.', 'Yeah.', 'Ok.', 'Um.', 'Mm.', 'Hmm.') when no actual question or instruction was intended.",
+    "- Do not interrupt your current response or start speaking a new turn for isolated ambient words or mic noise. Remain silent and keep listening until the user asks a genuine programming or workspace question.",
     "</language_and_voice>"
   ].join("\n");
 }

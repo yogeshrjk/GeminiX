@@ -1155,22 +1155,12 @@ function shareModelMessage(
     return;
   }
 
-  if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
-    navigator
-      .share({
-        title: "GeminiX Response",
-        text
-      })
-      .catch(() => {
-        vscode.postMessage({ type: "copyCode", code: text });
-      });
-  } else {
-    vscode.postMessage({ type: "copyCode", code: text });
-  }
+  // Forward to host extension to present system sharing options (Mail client, New Tab, Save File, Copy)
+  vscode.postMessage({ type: "shareResponse", value: text });
 
   button.innerHTML = lucideIconSvg("check", 12);
-  button.title = "Copied to share";
-  button.setAttribute("aria-label", "Copied to share");
+  button.title = "Share options opened";
+  button.setAttribute("aria-label", "Share options opened");
   window.setTimeout(() => {
     button.innerHTML = lucideIconSvg("share-2", 12);
     button.title = "Share response";
@@ -1671,6 +1661,34 @@ function normalizeSpokenUrls(text: string): string {
     .replace(/\bhttps?[\s:]+([a-zA-Z0-9-]+)[\s.]+(org|com|net|io|dev|edu|gov)\b/giu, "https://$1.$2")
     .replace(/\b([a-zA-Z0-9-]+)\s+(?:dot|\.)\s+([a-zA-Z0-9-]+)\s+(?:dot|\.)\s+(org|com|net|io|dev|edu|gov)\b/giu, "$1.$2.$3")
     .replace(/\b([a-zA-Z0-9-]+)\s+(?:dot|\.)\s+(org|com|net|io|dev|edu|gov)\b/giu, "$1.$2");
+}
+
+const SPURIOUS_VOICE_UTTERANCES = new Set([
+  "sí",
+  "si",
+  "yes",
+  "yeah",
+  "yep",
+  "ok",
+  "okay",
+  "um",
+  "uh",
+  "ah",
+  "mm",
+  "hmm",
+  "hm",
+  "huh",
+  "ha",
+  "oh"
+]);
+
+function isSpuriousVoiceInput(text: string): boolean {
+  const normalized = text
+    .trim()
+    .toLowerCase()
+    .replace(/[.,/#!$%^&*;:{}=\-_`~()?"'।]/gu, "")
+    .trim();
+  return SPURIOUS_VOICE_UTTERANCES.has(normalized);
 }
 
 function buildFileLinkHtml(
@@ -2806,7 +2824,7 @@ function handleServerMessage(payload: unknown): void {
 
     // When the user speaks (voice input) after a stop, clear suppression.
     const userText = content.inputTranscription?.text;
-    if (userText) {
+    if (userText && !isSpuriousVoiceInput(userText)) {
       state.suppressNextResponse = false;
       ensureActiveChat(userText);
       // A new spoken turn begins here — finalize any partial model answer

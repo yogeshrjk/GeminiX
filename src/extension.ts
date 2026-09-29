@@ -136,6 +136,85 @@ class GeminiXViewProvider
     }
   }
 
+  private async shareResponse(text: string | undefined): Promise<void> {
+    if (!text?.trim()) {
+      return;
+    }
+    const content = text.trim();
+    const preview = content.slice(0, 50).replace(/\s+/g, " ");
+
+    const options: (vscode.QuickPickItem & { id: string })[] = [
+      {
+        id: "mail",
+        label: "$(mail) Send via Email / Default Mail Client",
+        description: "Open your system's default email client with this response"
+      },
+      {
+        id: "newTab",
+        label: "$(file-text) Open in New Editor Tab",
+        description: "Open in a new Markdown document in VS Code"
+      },
+      {
+        id: "saveFile",
+        label: "$(save) Save as Markdown File...",
+        description: "Save response as a .md file to your computer"
+      },
+      {
+        id: "copy",
+        label: "$(clippy) Copy to Clipboard",
+        description: "Copy full response text to clipboard"
+      }
+    ];
+
+    const selected = await vscode.window.showQuickPick(options, {
+      placeHolder: `Share response: "${preview}…"`,
+      title: "Share GeminiX Response"
+    });
+
+    if (!selected) {
+      return;
+    }
+
+    switch (selected.id) {
+      case "mail": {
+        const subject = encodeURIComponent("GeminiX Response");
+        const body = encodeURIComponent(content);
+        const mailtoUri = vscode.Uri.parse(`mailto:?subject=${subject}&body=${body}`);
+        try {
+          await vscode.env.openExternal(mailtoUri);
+        } catch {
+          vscode.window.showErrorMessage("Could not open default mail client.");
+        }
+        break;
+      }
+      case "newTab": {
+        const doc = await vscode.workspace.openTextDocument({
+          content,
+          language: "markdown"
+        });
+        await vscode.window.showTextDocument(doc, { preview: false });
+        break;
+      }
+      case "saveFile": {
+        const uri = await vscode.window.showSaveDialog({
+          defaultUri: vscode.Uri.file("gemini-response.md"),
+          filters: { Markdown: ["md"], "All Files": ["*"] },
+          title: "Save Response as Markdown"
+        });
+        if (uri) {
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf8"));
+          void vscode.window.showInformationMessage(`Saved response to ${uri.fsPath}`);
+        }
+        break;
+      }
+      case "copy": {
+        await vscode.env.clipboard.writeText(content);
+        void vscode.window.showInformationMessage("Response copied to clipboard.");
+        break;
+      }
+    }
+  }
+
   public constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly secrets: vscode.SecretStorage,
@@ -315,6 +394,9 @@ class GeminiXViewProvider
           break;
         case "openExternal":
           this.openExternal(message.url);
+          break;
+        case "shareResponse":
+          await this.shareResponse(message.value);
           break;
       }
     } catch (error) {

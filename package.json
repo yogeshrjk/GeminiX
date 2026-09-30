@@ -2,7 +2,7 @@
   "name": "gemini-x",
   "displayName": "GeminiX",
   "description": "Explore and explain selected code with Gemini Live inside VS Code.",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "icon": "media/gemini-x.png",
   "publisher": "YogeshRajak",
   "license": "MIT",
@@ -44,7 +44,7 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "check": "tsc --noEmit && eslint .",
-    "package": "npm run check && npm run build && vsce package --out gemini-x-v0.6.6.vsix",
+    "package": "npm run check && npm run build && vsce package --out gemini-x-v0.6.7.vsix",
     "test": "node --import tsx --test tests/*.test.ts",
     "vscode:prepublish": "npm run build"
   },
@@ -202,6 +202,38 @@
             "Deeply technical and precise."
           ],
           "description": "Explanation style used by Gemini."
+        },
+        "liveline.liveModel": {
+          "type": "string",
+          "default": "gemini-3.8-live",
+          "enum": [
+            "gemini-3.8-live",
+            "gemini-3.1-flash-live-preview",
+            "gemini-3.8-live-extended-thinking"
+          ],
+          "enumDescriptions": [
+            "Gemini 3.8 Live (Default)",
+            "Gemini 3.1 Flash Live",
+            "Gemini 3.8 Live Extended Thinking (Not working properly, recommended using 3.8 Live)"
+          ],
+          "description": "Live model used for bidirectional streaming voice conversations."
+        },
+        "liveline.thinkingLevel": {
+          "type": "string",
+          "default": "high",
+          "enum": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          "enumDescriptions": [
+            "Minimal thinking for lowest latency.",
+            "Fast reasoning with concise thoughts.",
+            "Balanced thinking depth and speed.",
+            "Extended thinking for thorough, deep reasoning."
+          ],
+          "description": "Thinking level for Gemini Live extended thinking model."
         }
       }
     }

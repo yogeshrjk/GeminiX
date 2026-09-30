@@ -52,12 +52,19 @@ interface VsCodeApi {
 declare function acquireVsCodeApi(): VsCodeApi;
 
 type Behavior = "professional" | "friendly" | "expert";
+type LiveModel =
+  | "gemini-3.1-flash-live-preview"
+  | "gemini-3.8-live"
+  | "gemini-3.8-live-extended-thinking";
+type ThinkingLevel = "minimal" | "low" | "medium" | "high";
 
 interface Preferences {
   readonly voice: string;
   readonly preferredLanguage: string;
   readonly autoInterrupt: boolean;
   readonly behavior: Behavior;
+  readonly liveModel?: LiveModel;
+  readonly thinkingLevel?: ThinkingLevel;
 }
 
 interface ContextSummary {
@@ -95,9 +102,9 @@ type ChatRole = "user" | "model";
 interface ChatMessage {
   readonly id: string;
   readonly role: ChatRole;
-  readonly spokenText: string;
-  readonly visualText?: string;
-  readonly markdownBlocks?: readonly MarkdownBlock[];
+  spokenText: string;
+  visualText?: string;
+  markdownBlocks?: readonly MarkdownBlock[];
   readonly createdAt: string;
   readonly contextLabel?: string;
   readonly currentPageLabel?: string;
@@ -218,6 +225,8 @@ interface HostMessage {
   readonly frame?: ScreenFrame;
   readonly fromEdit?: boolean;
   readonly panel?: string;
+  readonly messageId?: string;
+  readonly correctedText?: string;
 }
 
 interface TranscriptMessage {
@@ -376,6 +385,7 @@ const elements = {
   historyPanel: requiredElement<HTMLElement>("historyPanel"),
   micMeter: requiredElement<HTMLElement>("micMeter"),
   mentionMenu: requiredElement<HTMLElement>("mentionMenu"),
+  modelSelect: requiredElement<HTMLSelectElement>("modelSelect"),
   muteMicButton: requiredElement<HTMLButtonElement>("muteMicButton"),
   orbCanvas: requiredElement<HTMLCanvasElement>("orbCanvas"),
   orbMode: requiredElement<HTMLElement>("orbMode"),
@@ -412,6 +422,9 @@ const elements = {
     requiredElement<HTMLButtonElement>("stopPlaybackButton"),
   textForm: requiredElement<HTMLFormElement>("textForm"),
   textInput: requiredElement<HTMLTextAreaElement>("textInput"),
+  thinkingLevelField: requiredElement<HTMLElement>("thinkingLevelField"),
+  thinkingLevelSelect:
+    requiredElement<HTMLSelectElement>("thinkingLevelSelect"),
   transcript: requiredElement<HTMLElement>("transcript"),
   voiceSelect: requiredElement<HTMLSelectElement>("voiceSelect"),
   voiceStage: requiredElement<HTMLElement>("voiceStage"),
@@ -454,7 +467,9 @@ const state = {
     voice: "Kore",
     preferredLanguage: "English",
     autoInterrupt: true,
-    behavior: "professional"
+    behavior: "professional",
+    liveModel: "gemini-3.8-live",
+    thinkingLevel: "high"
   } as Preferences,
   selection: undefined as ContextSummary | undefined,
   currentPage: undefined as CurrentPageSummary | undefined,
@@ -483,6 +498,7 @@ const state = {
   suppressRespeakTranscript: false,
   activeRespeakButton: null as HTMLButtonElement | null,
   pendingRespeak: undefined as string | undefined,
+  hasLiveTranscribeText: false,
   debugEntries: [] as { time: string; message: string }[],
 };
 
@@ -599,10 +615,23 @@ function submitApiKey(
   vscode.postMessage({ type: "saveApiKey", value: apiKey });
 }
 
+function updateThinkingLevelVisibility(): void {
+  const isExtended =
+    elements.modelSelect.value === "gemini-3.8-live-extended-thinking";
+  elements.thinkingLevelField.classList.toggle("hidden", !isExtended);
+}
+
 function applyPreferences(preferences: Preferences): void {
   state.preferences = preferences;
   elements.voiceSelect.value = preferences.voice;
   elements.languageSelect.value = preferences.preferredLanguage;
+  if (preferences.liveModel) {
+    elements.modelSelect.value = preferences.liveModel;
+  }
+  if (preferences.thinkingLevel) {
+    elements.thinkingLevelSelect.value = preferences.thinkingLevel;
+  }
+  updateThinkingLevelVisibility();
   elements.behaviorSelect.value = preferences.behavior;
   elements.autoInterruptInput.checked = preferences.autoInterrupt;
 }
@@ -807,9 +836,9 @@ function updateMentionMenu(): void {
   const query = match?.[2]?.toLowerCase() ?? "";
   const pageMatches = Boolean(
     state.currentPage &&
-      match &&
-      ("current".startsWith(query) ||
-        state.currentPage.fileName.toLowerCase().includes(query))
+    match &&
+    ("current".startsWith(query) ||
+      state.currentPage.fileName.toLowerCase().includes(query))
   );
 
   if (!match || !pageMatches) {
@@ -1033,6 +1062,7 @@ function createMessage(
     contextLabel,
     currentPageLabel
   };
+  wrapper.setAttribute("data-message-id", message.id);
   state.chatMessages.push({
     id: message.id,
     role,
@@ -1540,9 +1570,9 @@ function appendSpokenTranscript(text: string): void {
   if (storedIndex >= 0) {
     const existing = state.chatMessages[storedIndex];
     if (existing) {
-        state.chatMessages[storedIndex] = {
-          ...existing,
-          spokenText: message.spokenText
+      state.chatMessages[storedIndex] = {
+        ...existing,
+        spokenText: message.spokenText
       };
     }
   }
@@ -1621,7 +1651,7 @@ function appendMarkdownBlock(
       (functionCallId && block.functionCallId === functionCallId) ||
       (
         hashMarkdown(block.markdown) ===
-          hashMarkdown(normalizedMarkdown) &&
+        hashMarkdown(normalizedMarkdown) &&
         normalizeMarkdown(block.markdown) === normalizedMarkdown
       )
   );
@@ -1735,9 +1765,9 @@ const FILE_TOKEN_PATTERN = new RegExp(
 // boundaries keep us from splitting longer tokens (URLs, code, semver...).
 const FILE_REFERENCE_PATTERN = new RegExp(
   String.raw`(^|[^A-Za-z0-9_@~/. -])` +
-    String.raw`((?:[A-Za-z0-9_.@~-]+/)*[A-Za-z0-9_.@~-]+)` +
-    String.raw`(?::(\d+)(?::(\d+))?)?` +
-    String.raw`(?=$|[^A-Za-z0-9_@~/-])`,
+  String.raw`((?:[A-Za-z0-9_.@~-]+/)*[A-Za-z0-9_.@~-]+)` +
+  String.raw`(?::(\d+)(?::(\d+))?)?` +
+  String.raw`(?=$|[^A-Za-z0-9_@~/-])`,
   "giu"
 );
 
@@ -1780,8 +1810,8 @@ const WEB_DOMAIN_TLDS =
 
 const BARE_DOMAIN_PATTERN = new RegExp(
   "(^|[\\s([{'\"<>;*_~])((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+(?:" +
-    WEB_DOMAIN_TLDS +
-    ")(?:/[^\\s<)\"'`]*))",
+  WEB_DOMAIN_TLDS +
+  ")(?:/[^\\s<)\"'`]*))",
   "giu"
 );
 
@@ -2487,15 +2517,63 @@ async function renderModelMessage(
 }
 
 function finishTranscriptTurn(): void {
-  if (state.currentUserMessage) {
-    state.currentUserMessage.closed = true;
+  const userMessage = state.currentUserMessage;
+  const modelMessage = state.currentModelMessage;
+
+  if (userMessage) {
+    userMessage.closed = true;
   }
-  if (state.currentModelMessage) {
-    state.currentModelMessage.closed = true;
-    void renderModelMessage(state.currentModelMessage);
+  if (modelMessage) {
+    void renderModelMessage(modelMessage);
   }
+  state.hasLiveTranscribeText = false;
   scheduleChatSave();
   scrollTranscriptToBottom();
+}
+
+function handleUserTranscriptChunk(text: string): void {
+  if (!text.trim() || state.isRespeaking) {
+    return;
+  }
+  state.hasLiveTranscribeText = true;
+  state.respeakCancelled = false;
+  state.suppressRespeakTranscript = false;
+  state.suppressNextResponse = false;
+  ensureActiveChat(text);
+  finalizeModelMessage();
+  appendTranscript("user", text, state.pendingVoiceContext);
+  state.pendingVoiceContext = undefined;
+}
+
+function handleTranscriptCorrected(messageId: string, correctedText: string): void {
+  const cleanText = correctedText.trim();
+  if (!cleanText || state.editingUserMessageId === messageId) {
+    return;
+  }
+  const current = state.currentUserMessage;
+  if (current && current.id === messageId) {
+    current.spokenText = cleanText;
+    current.content.textContent = cleanText;
+  }
+  const storedIndex = state.chatMessages.findIndex(
+    (candidate) => candidate.id === messageId
+  );
+  if (storedIndex >= 0) {
+    const existing = state.chatMessages[storedIndex];
+    if (existing) {
+      state.chatMessages[storedIndex] = {
+        ...existing,
+        spokenText: cleanText
+      };
+    }
+  }
+  const el = elements.transcript.querySelector<HTMLElement>(
+    `[data-message-id="${messageId}"] .message-content`
+  );
+  if (el) {
+    el.textContent = cleanText;
+  }
+  scheduleChatSave();
 }
 
 function finalizeUserMessage(): void {
@@ -2525,6 +2603,7 @@ function resetTranscriptView(): void {
   state.currentModelMessage = undefined;
   state.currentUserMessage = undefined;
   state.pendingVoiceContext = undefined;
+  state.hasLiveTranscribeText = false;
   state.suppressRespeakTranscript = false;
   state.pendingModelApplyTargetId = undefined;
   state.activeSearches = 0;
@@ -2688,6 +2767,8 @@ function completeActivitySearch(): void {
       setActivityIndicator("image", "Analyzing image source…");
     } else if (state.reasoning) {
       setActivityIndicator("brain", "Reasoning…");
+    } else if (state.answering) {
+      setActivityIndicator("volume-2", "Answering…");
     } else {
       setActivityIndicator("lightbulb", "Thinking…");
     }
@@ -2717,7 +2798,9 @@ function markAnswering(): void {
     return;
   }
   state.answering = true;
-  setActivityIndicator("volume-2", "Answering…");
+  if (state.activeSearches === 0 && !state.reasoning) {
+    setActivityIndicator("volume-2", "Answering…");
+  }
 }
 
 function markReasoning(): void {
@@ -3113,8 +3196,8 @@ function handleServerMessage(payload: unknown): void {
   if (payload.error) {
     showError(
       payload.error.message ??
-        payload.error.status ??
-        "Gemini returned an API error."
+      payload.error.status ??
+      "Gemini returned an API error."
     );
     setStatus("API error", "error");
     return;
@@ -3178,7 +3261,9 @@ function handleServerMessage(payload: unknown): void {
       // A new spoken turn begins here — finalize any partial model answer
       // from the previous turn so its text does not bleed into this one.
       finalizeModelMessage();
-      appendTranscript("user", userText, state.pendingVoiceContext);
+      if (!state.hasLiveTranscribeText) {
+        appendTranscript("user", userText, state.pendingVoiceContext);
+      }
       state.pendingVoiceContext = undefined;
     }
 
@@ -3292,13 +3377,13 @@ function handleToolCall(toolCall: GeminiToolCall): void {
         response:
           renderResult === "invalid"
             ? {
-                success: false,
-                error: "The markdown argument must be a non-empty string."
-              }
+              success: false,
+              error: "The markdown argument must be a non-empty string."
+            }
             : {
-                success: true,
-                duplicate: renderResult === "duplicate"
-              }
+              success: true,
+              duplicate: renderResult === "duplicate"
+            }
       }
     });
   }
@@ -3586,6 +3671,18 @@ function handleHostMessage(message: HostMessage): void {
     case "sessionOpened":
       setStatus("Configuring Gemini", "busy");
       break;
+    case "userTranscriptChunk":
+      if (message.text) {
+        handleUserTranscriptChunk(message.text);
+      }
+      break;
+    case "userTranscriptTurnComplete":
+      break;
+    case "transcriptCorrected":
+      if (message.messageId && message.correctedText) {
+        handleTranscriptCorrected(message.messageId, message.correctedText);
+      }
+      break;
     case "serverMessage":
       handleServerMessage(message.payload);
       break;
@@ -3616,7 +3713,7 @@ function handleHostMessage(message: HostMessage): void {
       if (!message.success) {
         pushDebugLog(
           message.message ??
-            `${message.functionName ?? "Tool"} response failed (${message.functionCallId ?? "unknown id"}).`
+          `${message.functionName ?? "Tool"} response failed (${message.functionCallId ?? "unknown id"}).`
         );
         if (message.functionCallId) {
           state.handledFunctionCallIds.delete(message.functionCallId);
@@ -3682,9 +3779,9 @@ function handleHostMessage(message: HostMessage): void {
         const detail = isGoAway
           ? "Gemini closed the live session after its connection time limit. Click “Start live session” to reconnect."
           : message.reason ||
-            (message.code === 1008
-              ? `Gemini Live rejected the connection (code ${message.code}). Verify the API key, selected model, Live API support, and session configuration. Please restart the live session.`
-              : `Gemini Live connection closed (code ${message.code ?? "unknown"}). Please restart the live session.`);
+          (message.code === 1008
+            ? `Gemini Live rejected the connection (code ${message.code}). Verify the API key, selected model, Live API support, and session configuration. Please restart the live session.`
+            : `Gemini Live connection closed (code ${message.code ?? "unknown"}). Please restart the live session.`);
         showError(detail);
         setStatus("Disconnected", isGoAway ? "idle" : "error");
       }
@@ -4141,6 +4238,10 @@ elements.debugClearButton.addEventListener("click", () => {
   elements.debugBadge.classList.add("hidden");
 });
 
+elements.modelSelect.addEventListener("change", () => {
+  updateThinkingLevelVisibility();
+});
+
 elements.savePreferencesButton.addEventListener("click", () => {
   const behaviorValue = elements.behaviorSelect.value;
   const behavior: Behavior =
@@ -4148,11 +4249,29 @@ elements.savePreferencesButton.addEventListener("click", () => {
       ? behaviorValue
       : "professional";
 
+  const modelValue = elements.modelSelect.value;
+  const liveModel: LiveModel =
+    modelValue === "gemini-3.1-flash-live-preview" ||
+    modelValue === "gemini-3.8-live-extended-thinking"
+      ? modelValue
+      : "gemini-3.8-live";
+
+  const thinkingLevelValue = elements.thinkingLevelSelect.value;
+  const thinkingLevel: ThinkingLevel =
+    thinkingLevelValue === "minimal" ||
+    thinkingLevelValue === "low" ||
+    thinkingLevelValue === "medium" ||
+    thinkingLevelValue === "high"
+      ? thinkingLevelValue
+      : "high";
+
   const preferences: Preferences = {
     voice: elements.voiceSelect.value,
     preferredLanguage: elements.languageSelect.value,
     autoInterrupt: elements.autoInterruptInput.checked,
-    behavior
+    behavior,
+    liveModel,
+    thinkingLevel
   };
   elements.settingsFeedback.classList.add("hidden");
   vscode.postMessage({ type: "savePreferences", preferences });

@@ -23,6 +23,8 @@ import {
 } from "./prompts.js";
 import { readPreferences, savePreferences } from "./preferences.js";
 import { isDirectSelectedCodeRequest } from "./requestIntent.js";
+import { TranscribeLiveSession } from "./transcribeSession.js";
+import { reconcileSpokenTranscript } from "./transcriptReconciler.js";
 import type { EditorContext, Preferences, StoredChat } from "./types.js";
 import { WorkspaceContextRetriever } from "./workspaceContext.js";
 
@@ -51,6 +53,9 @@ interface WebviewMessage {
   readonly data?: string;
   readonly startLine?: number;
   readonly fromEdit?: boolean;
+  readonly messageId?: string;
+  readonly rawTranscript?: string;
+  readonly modelResponse?: string;
 }
 
 interface ApplyTarget {
@@ -82,10 +87,10 @@ const MAX_WORKSPACE_TOOL_CALLS_PER_TURN = 8;
 const MAX_URL_TEXT_CHARS = 60_000;
 
 class GeminiXViewProvider
-  implements vscode.WebviewViewProvider, vscode.Disposable
-{
+  implements vscode.WebviewViewProvider, vscode.Disposable {
   private view: vscode.WebviewView | undefined;
   private session: LiveSession | undefined;
+  private transcribeSession: TranscribeLiveSession | undefined;
   private microphone: MicrophoneCapture | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   private readonly workspaceContextRetriever = new WorkspaceContextRetriever();
@@ -420,6 +425,13 @@ class GeminiXViewProvider
         case "respeakMessage":
           this.handleRespeakMessage(message.text);
           break;
+        case "reconcileVoiceTranscript":
+          await this.reconcileVoiceTranscript(
+            message.messageId,
+            message.rawTranscript,
+            message.modelResponse
+          );
+          break;
       }
     } catch (error) {
       this.post({
@@ -473,6 +485,10 @@ class GeminiXViewProvider
       type: "preferencesSaved",
       preferences: savedPreferences,
     });
+
+    if (this.session?.isConnected) {
+      await this.startSession();
+    }
   }
 
   private async startSession(): Promise<void> {
@@ -488,11 +504,27 @@ class GeminiXViewProvider
       this.handleSessionEvent(event);
     });
 
+    this.transcribeSession = new TranscribeLiveSession({
+      onTranscriptChunk: (text) => {
+        this.post({ type: "userTranscriptChunk", text });
+      },
+      onTurnComplete: () => {
+        this.post({ type: "userTranscriptTurnComplete" });
+      },
+      onError: (message) => {
+        this.post({
+          type: "debugLog",
+          message: `Live transcribe note: ${message}`,
+        });
+      },
+    });
+
     try {
       this.microphone = new MicrophoneCapture({
         onFrame: (frame) => {
           if (!this.micMuted) {
             this.session?.sendPcm16(frame);
+            this.transcribeSession?.sendPcm16(frame);
           }
         },
         onLevel: (level) => {
@@ -508,6 +540,7 @@ class GeminiXViewProvider
       });
       this.microphone.start();
       this.session.connect(apiKey, readPreferences());
+      this.transcribeSession.connect(apiKey);
     } catch (error) {
       this.disposeLiveResources();
       // Report through the normal session-error path instead of throwing:
@@ -922,8 +955,38 @@ class GeminiXViewProvider
     this.stopScreenSharing();
     this.microphone?.dispose();
     this.microphone = undefined;
+    this.transcribeSession?.dispose();
+    this.transcribeSession = undefined;
     this.session?.dispose();
     this.session = undefined;
+  }
+
+  private async reconcileVoiceTranscript(
+    messageId: string | undefined,
+    rawTranscript: string | undefined,
+    modelResponse: string | undefined
+  ): Promise<void> {
+    if (!messageId || !rawTranscript || !modelResponse) {
+      return;
+    }
+    const apiKey = await this.secrets.get(API_KEY_SECRET);
+    if (!apiKey) {
+      return;
+    }
+    const preferences = readPreferences();
+    const correctedText = await reconcileSpokenTranscript({
+      rawTranscript,
+      assistantResponse: modelResponse,
+      preferredLanguage: preferences.preferredLanguage,
+      apiKey,
+    });
+    if (correctedText) {
+      this.post({
+        type: "transcriptCorrected",
+        messageId,
+        correctedText,
+      });
+    }
   }
 
   private async postApiStatus(): Promise<void> {
@@ -1007,10 +1070,10 @@ class GeminiXViewProvider
     const activeSelection =
       activeEditor && !activeEditor.selection.isEmpty
         ? {
-            uri: activeEditor.document.uri,
-            range: activeEditor.selection,
-            originalText: activeEditor.document.getText(activeEditor.selection),
-          }
+          uri: activeEditor.document.uri,
+          range: activeEditor.selection,
+          originalText: activeEditor.document.getText(activeEditor.selection),
+        }
         : undefined;
     const capturedTarget = targetId
       ? this.applyTargets.get(targetId)
@@ -1582,6 +1645,23 @@ class GeminiXViewProvider
 
         <div class="settings-group">
           <label class="field">
+            <span>Live model</span>
+            <select id="modelSelect">
+              <option value="gemini-3.8-live">Gemini 3.8 Live (Default)</option>
+              <option value="gemini-3.1-flash-live-preview">Gemini 3.1 Flash Live</option>
+              <option value="gemini-3.8-live-extended-thinking">Gemini 3.8 Live Extended Thinking (Not working properly, recommended using 3.8 Live)</option>
+            </select>
+          </label>
+          <label id="thinkingLevelField" class="field hidden">
+            <span>Thinking level</span>
+            <select id="thinkingLevelSelect">
+              <option value="minimal">Minimal</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High (Extended)</option>
+            </select>
+          </label>
+          <label class="field">
             <span>Gemini voice</span>
             <select id="voiceSelect"></select>
           </label>
@@ -1683,18 +1763,70 @@ function displayFileName(filePath: string): string {
 
 const GITHUB_REPO_URL = /^https?:\/\/github\.com\/([^/?#]+)\/([^/?#]+)/i;
 
+function extractHtmlTextAndMeta(html: string): { title: string; text: string } {
+  const title =
+    /<title[^>]*>([^<]*)<\/title>/i.exec(html)?.[1]?.trim() ||
+    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i
+      .exec(html)?.[1]
+      ?.trim() ||
+    /<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']*)["']/i
+      .exec(html)?.[1]
+      ?.trim() ||
+    "";
+
+  const metaDescriptions: string[] = [];
+  const ogDesc =
+    /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i
+      .exec(html)?.[1]
+      ?.trim();
+  const metaDesc =
+    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i
+      .exec(html)?.[1]
+      ?.trim();
+  const twitterDesc =
+    /<meta[^>]+name=["']twitter:description["'][^>]+content=["']([^"']*)["']/i
+      .exec(html)?.[1]
+      ?.trim();
+  const siteName =
+    /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']*)["']/i
+      .exec(html)?.[1]
+      ?.trim();
+
+  if (siteName) {
+    metaDescriptions.push(`Website: ${siteName}`);
+  }
+  if (metaDesc) {
+    metaDescriptions.push(`Description: ${metaDesc}`);
+  } else if (ogDesc) {
+    metaDescriptions.push(`Description: ${ogDesc}`);
+  }
+  if (twitterDesc && twitterDesc !== metaDesc && twitterDesc !== ogDesc) {
+    metaDescriptions.push(`Summary: ${twitterDesc}`);
+  }
+
+  const bodyText = stripHtml(html);
+  const metaHeader =
+    metaDescriptions.length > 0 ? `${metaDescriptions.join("\n")}\n\n` : "";
+  const combinedText = `${metaHeader}${bodyText}`.trim();
+
+  return { title, text: combinedText };
+}
+
 async function fetchUrlAsText(url: string): Promise<{
   title: string;
   text: string;
   truncated: boolean;
 }> {
   const { body, contentType } = await fetchWithTimeout(url);
-  const title = contentType.includes("text/html")
-    ? /<title[^>]*>([^<]*)<\/title>/i.exec(body)?.[1]?.trim() || url
-    : url;
-  const htmlText = contentType.includes("text/html") ? stripHtml(body) : body;
+  let title = url;
+  let text = body;
 
-  let text = htmlText;
+  if (contentType.includes("text/html") || body.includes("<html") || body.includes("<title")) {
+    const extracted = extractHtmlTextAndMeta(body);
+    title = extracted.title || url;
+    text = extracted.text;
+  }
+
   const repoMatch = GITHUB_REPO_URL.exec(url);
   if (repoMatch?.[1] && repoMatch[2]) {
     const readme = await fetchRawReadme(
@@ -1702,7 +1834,7 @@ async function fetchUrlAsText(url: string): Promise<{
       repoMatch[2].replace(/\.git$/i, ""),
     );
     if (readme) {
-      text = `${htmlText}\n\n--- RAW README ---\n${readme}`;
+      text = `${text}\n\n--- RAW README ---\n${readme}`;
     }
   }
 
@@ -1726,8 +1858,11 @@ async function fetchWithTimeout(url: string): Promise<{
       signal: controller.signal,
       redirect: "follow",
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; GeminiX/1.0)",
-        Accept: "text/html,text/plain,application/json,*/*",
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,text/plain,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
       },
     });
     if (!response.ok) {
@@ -1815,11 +1950,107 @@ async function searchWikipedia(
     .filter((result): result is WebSearchResult => result !== undefined);
 }
 
+async function searchDuckDuckGo(
+  query: string,
+): Promise<readonly WebSearchResult[]> {
+  const results: WebSearchResult[] = [];
+  const seenUrls = new Set<string>();
+
+  try {
+    const { body } = await fetchWithTimeout(
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
+    );
+    const data: unknown = JSON.parse(body);
+    if (typeof data === "object" && data !== null) {
+      const rec = data as {
+        Heading?: unknown;
+        AbstractText?: unknown;
+        AbstractURL?: unknown;
+        RelatedTopics?: unknown;
+      };
+      const heading = typeof rec.Heading === "string" ? rec.Heading : "";
+      const abstractText =
+        typeof rec.AbstractText === "string" ? rec.AbstractText : "";
+      const abstractUrl =
+        typeof rec.AbstractURL === "string" ? rec.AbstractURL : "";
+      if (abstractText && abstractUrl && !seenUrls.has(abstractUrl)) {
+        seenUrls.add(abstractUrl);
+        results.push({
+          title: heading || query,
+          url: abstractUrl,
+          description: abstractText,
+        });
+      }
+
+      if (Array.isArray(rec.RelatedTopics)) {
+        for (const topic of rec.RelatedTopics) {
+          const t = topic as { Text?: unknown; FirstURL?: unknown };
+          const text = typeof t.Text === "string" ? t.Text : "";
+          const firstUrl = typeof t.FirstURL === "string" ? t.FirstURL : "";
+          if (text && firstUrl && !seenUrls.has(firstUrl)) {
+            seenUrls.add(firstUrl);
+            results.push({
+              title: text.split(" - ")[0] || text.slice(0, 60),
+              url: firstUrl,
+              description: text,
+            });
+          }
+        }
+      }
+    }
+  } catch {
+    // Continue to HTML search
+  }
+
+  try {
+    const { body } = await fetchWithTimeout(
+      `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+    );
+
+    const generalResultRegex =
+      /<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+
+    let match: RegExpExecArray | null;
+    while ((match = generalResultRegex.exec(body)) !== null) {
+      let rawHref = match[1] || "";
+      const rawTitle = stripHtml(match[2] || "");
+      const rawSnippet = stripHtml(match[3] || "");
+
+      if (rawHref.includes("uddg=")) {
+        const uddgMatch = /uddg=([^&]+)/.exec(rawHref);
+        if (uddgMatch?.[1]) {
+          rawHref = decodeURIComponent(uddgMatch[1]);
+        }
+      }
+      if (rawHref.startsWith("//")) {
+        rawHref = `https:${rawHref}`;
+      }
+
+      if (rawHref && /^https?:\/\//i.test(rawHref) && !seenUrls.has(rawHref)) {
+        seenUrls.add(rawHref);
+        results.push({
+          title: rawTitle || query,
+          url: rawHref,
+          description: rawSnippet,
+        });
+      }
+      if (results.length >= 8) {
+        break;
+      }
+    }
+  } catch {
+    // Continue with existing results
+  }
+
+  return results;
+}
+
 async function searchWebSource(
   query: string,
   source: string,
 ): Promise<readonly WebSearchResult[]> {
-  switch (source) {
+  const normSource = source.toLowerCase().trim();
+  switch (normSource) {
     case "stackoverflow":
       return searchStackOverflow(query);
     case "mdn":
@@ -1836,9 +2067,23 @@ async function searchWebSource(
       return lookupGoModule(query);
     case "registry":
       return lookupPackage(query);
-    case "wikipedia":
-    default:
+    case "wikipedia": {
+      const wikiResults = await searchWikipedia(query);
+      if (wikiResults.length > 0) {
+        return wikiResults;
+      }
+      return searchDuckDuckGo(query);
+    }
+    case "google":
+    case "web":
+    case "duckduckgo":
+    default: {
+      const webResults = await searchDuckDuckGo(query);
+      if (webResults.length > 0) {
+        return webResults;
+      }
       return searchWikipedia(query);
+    }
   }
 }
 
@@ -1847,7 +2092,7 @@ async function searchStackOverflow(
 ): Promise<readonly WebSearchResult[]> {
   const { body } = await fetchWithTimeout(
     "https://api.stackexchange.com/2.3/search/advanced" +
-      `?order=desc&sort=relevance&pagesize=5&site=stackoverflow&q=${encodeURIComponent(query)}`,
+    `?order=desc&sort=relevance&pagesize=5&site=stackoverflow&q=${encodeURIComponent(query)}`,
   );
   const data: unknown = JSON.parse(body);
   const items = (data as { items?: unknown }).items;
@@ -1947,45 +2192,107 @@ async function searchHackerNews(
 async function searchGitHubRepos(
   query: string,
 ): Promise<readonly WebSearchResult[]> {
-  const { body } = await fetchWithTimeout(
-    `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&per_page=5`,
-  );
-  const data: unknown = JSON.parse(body);
-  const items = (data as { items?: unknown }).items;
-  if (!Array.isArray(items)) {
-    return [];
+  const trimmed = query.trim();
+  const variations = new Set<string>([trimmed]);
+  if (trimmed.includes(" ")) {
+    variations.add(trimmed.replace(/\s+/g, ""));
+    variations.add(trimmed.replace(/\s+/g, "-"));
+    variations.add(trimmed.replace(/\s+/g, "_"));
   }
-  return items
-    .map((item): WebSearchResult | undefined => {
-      const record = item as {
-        full_name?: unknown;
-        html_url?: unknown;
-        description?: unknown;
-        stargazers_count?: unknown;
-        language?: unknown;
-        license?: { spdx_id?: unknown } | null;
-      };
-      const fullName =
-        typeof record.full_name === "string" ? record.full_name : "";
-      const htmlUrl =
-        typeof record.html_url === "string" ? record.html_url : "";
-      if (!fullName || !htmlUrl) {
-        return undefined;
+
+  const results: WebSearchResult[] = [];
+  const seenUrls = new Set<string>();
+
+  for (const variant of variations) {
+    try {
+      const [usersRes, reposRes] = await Promise.allSettled([
+        fetchWithTimeout(
+          `https://api.github.com/search/users?q=${encodeURIComponent(variant)}&per_page=5`,
+        ),
+        fetchWithTimeout(
+          `https://api.github.com/search/repositories?q=${encodeURIComponent(variant)}&per_page=5`,
+        ),
+      ]);
+
+      if (usersRes.status === "fulfilled") {
+        try {
+          const data: unknown = JSON.parse(usersRes.value.body);
+          const users = (data as { items?: unknown }).items;
+          if (Array.isArray(users)) {
+            for (const item of users) {
+              const u = item as {
+                login?: unknown;
+                html_url?: unknown;
+                type?: unknown;
+              };
+              const login = typeof u.login === "string" ? u.login : "";
+              const htmlUrl = typeof u.html_url === "string" ? u.html_url : "";
+              if (htmlUrl && !seenUrls.has(htmlUrl)) {
+                seenUrls.add(htmlUrl);
+                results.push({
+                  title: `GitHub User: @${login}`,
+                  url: htmlUrl,
+                  description: `GitHub ${typeof u.type === "string" ? u.type : "User"} profile for @${login}. Profile URL: ${htmlUrl}`,
+                });
+              }
+            }
+          }
+        } catch {
+          // ignore parse error
+        }
       }
-      const license =
-        record.license && typeof record.license.spdx_id === "string"
-          ? record.license.spdx_id
-          : "no license";
-      const description =
-        typeof record.description === "string" ? record.description : "";
-      return {
-        title: fullName,
-        url: htmlUrl,
-        description:
-          `${typeof record.stargazers_count === "number" ? record.stargazers_count : 0} stars, ${typeof record.language === "string" ? record.language : "unknown"} language, ${license}. ${description}`.trim(),
-      };
-    })
-    .filter((result): result is WebSearchResult => result !== undefined);
+
+      if (reposRes.status === "fulfilled") {
+        try {
+          const data: unknown = JSON.parse(reposRes.value.body);
+          const items = (data as { items?: unknown }).items;
+          if (Array.isArray(items)) {
+            for (const item of items) {
+              const record = item as {
+                full_name?: unknown;
+                html_url?: unknown;
+                description?: unknown;
+                stargazers_count?: unknown;
+                language?: unknown;
+                license?: { spdx_id?: unknown } | null;
+              };
+              const fullName =
+                typeof record.full_name === "string" ? record.full_name : "";
+              const htmlUrl =
+                typeof record.html_url === "string" ? record.html_url : "";
+              if (fullName && htmlUrl && !seenUrls.has(htmlUrl)) {
+                seenUrls.add(htmlUrl);
+                const license =
+                  record.license && typeof record.license.spdx_id === "string"
+                    ? record.license.spdx_id
+                    : "no license";
+                const description =
+                  typeof record.description === "string"
+                    ? record.description
+                    : "";
+                results.push({
+                  title: fullName,
+                  url: htmlUrl,
+                  description:
+                    `${typeof record.stargazers_count === "number" ? record.stargazers_count : 0} stars, ${typeof record.language === "string" ? record.language : "unknown"} language, ${license}. ${description}`.trim(),
+                });
+              }
+            }
+          }
+        } catch {
+          // ignore parse error
+        }
+      }
+
+      if (results.length >= 5) {
+        break;
+      }
+    } catch {
+      // Continue to next variation
+    }
+  }
+
+  return results.slice(0, 10);
 }
 
 const NODE_RELEASES_URL = "https://nodejs.org/dist/index.json";
@@ -2083,7 +2390,7 @@ async function lookupCrate(name: string): Promise<readonly WebSearchResult[]> {
     ).crate;
     const version =
       typeof crate?.max_stable_version === "string" &&
-      crate.max_stable_version.length > 0
+        crate.max_stable_version.length > 0
         ? crate.max_stable_version
         : typeof crate?.newest_version === "string"
           ? crate.newest_version
@@ -2207,4 +2514,4 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 }
 
-export function deactivate(): void {}
+export function deactivate(): void { }

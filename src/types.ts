@@ -54,15 +54,32 @@ export const PREFERRED_LANGUAGES = [
 
 export const BEHAVIORS = ["professional", "friendly", "expert"] as const;
 
+export const LIVE_MODELS = [
+  "gemini-3.1-flash-live-preview",
+  "gemini-3.8-live",
+  "gemini-3.8-live-extended-thinking"
+] as const;
+
+export const THINKING_LEVELS = [
+  "minimal",
+  "low",
+  "medium",
+  "high"
+] as const;
+
 export type GeminiVoice = (typeof GEMINI_VOICES)[number];
 export type PreferredLanguage = (typeof PREFERRED_LANGUAGES)[number];
 export type Behavior = (typeof BEHAVIORS)[number];
+export type LiveModel = (typeof LIVE_MODELS)[number];
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 export interface Preferences {
   readonly voice: GeminiVoice;
   readonly preferredLanguage: PreferredLanguage;
   readonly autoInterrupt: boolean;
   readonly behavior: Behavior;
+  readonly liveModel?: LiveModel;
+  readonly thinkingLevel?: ThinkingLevel;
 }
 
 export interface EditorContext {
@@ -141,9 +158,9 @@ export interface MarkdownBlock {
 export interface ChatMessage {
   readonly id: string;
   readonly role: ChatRole;
-  readonly spokenText: string;
-  readonly visualText?: string;
-  readonly markdownBlocks?: readonly MarkdownBlock[];
+  spokenText: string;
+  visualText?: string;
+  markdownBlocks?: readonly MarkdownBlock[];
   readonly createdAt: string;
   readonly contextLabel?: string;
   readonly currentPageLabel?: string;

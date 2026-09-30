@@ -2,7 +2,9 @@ import * as vscode from "vscode";
 import {
   BEHAVIORS,
   GEMINI_VOICES,
+  LIVE_MODELS,
   PREFERRED_LANGUAGES,
+  THINKING_LEVELS,
   type Preferences
 } from "./types.js";
 
@@ -18,6 +20,8 @@ export function readPreferences(): Preferences {
   const voiceValue = configuration.get<string>("voice");
   const languageValue = configuration.get<string>("preferredLanguage");
   const behaviorValue = configuration.get<string>("behavior");
+  const liveModelValue = configuration.get<string>("liveModel");
+  const thinkingLevelValue = configuration.get<string>("thinkingLevel");
 
   return {
     voice: isOneOf(voiceValue, GEMINI_VOICES) ? voiceValue : "Kore",
@@ -27,7 +31,13 @@ export function readPreferences(): Preferences {
     autoInterrupt: configuration.get<boolean>("autoInterrupt", true),
     behavior: isOneOf(behaviorValue, BEHAVIORS)
       ? behaviorValue
-      : "professional"
+      : "professional",
+    liveModel: isOneOf(liveModelValue, LIVE_MODELS)
+      ? liveModelValue
+      : "gemini-3.8-live",
+    thinkingLevel: isOneOf(thinkingLevelValue, THINKING_LEVELS)
+      ? thinkingLevelValue
+      : "high"
   };
 }
 
@@ -38,6 +48,10 @@ export async function savePreferences(
     !isOneOf(preferences.voice, GEMINI_VOICES) ||
     !isOneOf(preferences.preferredLanguage, PREFERRED_LANGUAGES) ||
     !isOneOf(preferences.behavior, BEHAVIORS) ||
+    (preferences.liveModel !== undefined &&
+      !isOneOf(preferences.liveModel, LIVE_MODELS)) ||
+    (preferences.thinkingLevel !== undefined &&
+      !isOneOf(preferences.thinkingLevel, THINKING_LEVELS)) ||
     typeof preferences.autoInterrupt !== "boolean"
   ) {
     throw new Error("One or more GeminiX settings are invalid.");
@@ -63,6 +77,16 @@ export async function savePreferences(
     configuration.update(
       "behavior",
       preferences.behavior,
+      vscode.ConfigurationTarget.Global
+    ),
+    configuration.update(
+      "liveModel",
+      preferences.liveModel ?? "gemini-3.8-live",
+      vscode.ConfigurationTarget.Global
+    ),
+    configuration.update(
+      "thinkingLevel",
+      preferences.thinkingLevel ?? "high",
       vscode.ConfigurationTarget.Global
     )
   ]);

@@ -14,6 +14,8 @@ import {
 } from "../src/prompts.ts";
 import { isDirectSelectedCodeRequest } from "../src/requestIntent.ts";
 import { shouldInterruptPlayback } from "../webview/playbackPolicy.ts";
+import { TranscribeLiveSession } from "../src/transcribeSession.ts";
+import { reconcileSpokenTranscript } from "../src/transcriptReconciler.ts";
 
 void test("asks for clarification instead of inventing intent from a fragment", () => {
   const instruction = buildSystemInstruction({
@@ -23,10 +25,10 @@ void test("asks for clarification instead of inventing intent from a fragment", 
     behavior: "professional"
   });
 
-  assert.match(instruction, /current user message is the request to answer/u);
-  assert.match(instruction, /isolated letter, short fragment/u);
-  assert.match(instruction, /do not search the web/u);
-  assert.match(instruction, /prior assistant claim/u);
+  assert.match(instruction, /current user message as the task to solve/u);
+  assert.match(instruction, /ask one short clarification question instead of inventing missing context/u);
+  assert.match(instruction, /Do not search the web merely to explain stable programming concepts/u);
+  assert.match(instruction, /Never attribute an earlier GeminiX statement to the user/u);
 });
 
 void test("requires complete requested JSON to be rendered instead of described", () => {
@@ -37,10 +39,10 @@ void test("requires complete requested JSON to be rendered instead of described"
     behavior: "professional"
   });
 
-  assert.match(instruction, /MUST call `render_markdown` with the full artifact/u);
-  assert.match(instruction, /statement that the artifact is 'below' is not a substitute/u);
-  assert.match(instruction, /complete JSON in a fenced `json` code block/u);
-  assert.match(instruction, /do not invent data or pretend it was rendered/u);
+  assert.match(instruction, /Use render_markdown whenever/u);
+  assert.match(instruction, /Put the complete requested artifact in the render_markdown call/u);
+  assert.match(instruction, /For JSON or structured data requests, provide the actual requested data/u);
+  assert.match(instruction, /unless you call render_markdown in the same turn/u);
 });
 
 void test("mandates calling render_markdown for coding and implementation questions", () => {
@@ -51,10 +53,10 @@ void test("mandates calling render_markdown for coding and implementation questi
     behavior: "professional"
   });
 
-  assert.match(instruction, /MANDATORY FOR ALL CODE AND STRUCTURED CONTENT/u);
-  assert.match(instruction, /how to write a program/u);
-  assert.match(instruction, /MUST call `render_markdown` with the full working code in a fenced code block/u);
-  assert.match(instruction, /NO GHOST VISUAL REFERENCES/u);
+  assert.match(instruction, /Visual tool: render_markdown/u);
+  assert.match(instruction, /Use render_markdown whenever the user needs code/u);
+  assert.match(instruction, /Use fenced code blocks with the correct language identifier/u);
+  assert.match(instruction, /Never say that code, a table, JSON, a diagram, or another artifact is visible in the panel unless you call render_markdown/u);
 });
 
 void test("recognizes direct selected-code requests without intercepting explanations", () => {
@@ -83,8 +85,8 @@ void test("marks restored history as context and distinguishes assistant replies
     }
   ]);
 
-  assert.match(history, /history is context, not a new request/u);
-  assert.match(history, /never attribute an assistant claim to the user/u);
+  assert.match(history, /prior conversation context, not a new request/u);
+  assert.match(history, /Never treat a previous GeminiX response as something the user said or confirmed/u);
   assert.match(history, /User: G/u);
   assert.match(history, /GeminiX: Node\.js/u);
 });
@@ -152,4 +154,57 @@ void test("only a Gemini interrupted event clears playback", () => {
   assert.equal(shouldInterruptPlayback({ interrupted: true }), true);
   assert.equal(shouldInterruptPlayback({ interrupted: false }), false);
   assert.equal(shouldInterruptPlayback({}), false);
+});
+
+void test("reconcileSpokenTranscript gracefully handles missing or empty inputs", async () => {
+  const result1 = await reconcileSpokenTranscript({
+    rawTranscript: "",
+    assistantResponse: "Response text",
+    preferredLanguage: "Hindi",
+    apiKey: "test-key"
+  });
+  assert.equal(result1, undefined);
+
+  const result2 = await reconcileSpokenTranscript({
+    rawTranscript: "Sí, hombre",
+    assistantResponse: "",
+    preferredLanguage: "Hindi",
+    apiKey: "test-key"
+  });
+  assert.equal(result2, undefined);
+
+  const result3 = await reconcileSpokenTranscript({
+    rawTranscript: "Hello",
+    assistantResponse: "Hi there",
+    preferredLanguage: "English",
+    apiKey: ""
+  });
+  assert.equal(result3, undefined);
+});
+
+void test("TranscribeLiveSession can be instantiated and managed", () => {
+  const chunks: string[] = [];
+  const session = new TranscribeLiveSession({
+    onTranscriptChunk: (text) => chunks.push(text)
+  });
+  assert.equal(session.isConnected, false);
+  session.disconnect();
+  session.dispose();
+  assert.equal(chunks.length, 0);
+});
+
+void test("LiveSession preferences support model switching and thinking level", () => {
+  const defaultPrefs = {
+    voice: "Kore" as const,
+    preferredLanguage: "English" as const,
+    autoInterrupt: true,
+    behavior: "professional" as const
+  };
+  const extendedPrefs = {
+    ...defaultPrefs,
+    liveModel: "gemini-3.8-live-extended-thinking" as const,
+    thinkingLevel: "high" as const
+  };
+  assert.equal(extendedPrefs.liveModel, "gemini-3.8-live-extended-thinking");
+  assert.equal(extendedPrefs.thinkingLevel, "high");
 });

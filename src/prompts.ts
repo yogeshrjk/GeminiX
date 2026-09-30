@@ -71,6 +71,7 @@ function buildLanguageAndVoiceSection(preferredLanguage: string): string {
     "- Distinguish carefully between 'User is requesting a link or resource' (e.g. 'give me link of github...', 'find the GitHub repo for...', 'what is the documentation link?') vs 'User has provided a link'. If no actual URL string is in the prompt, the user is ASKING for information or links, not providing one. Never claim or assume 'Since you provided the link...' or hallucinate a non-existent URL or repository.",
     "- When the user asks for a link, GitHub repository, documentation, or tool, call search_web to look it up and provide the real link. Never assume they already gave it to you.",
     "- If a speech transcription is incomplete, ambiguous, or garbled (e.g. truncated sentence or misheard words), do NOT invent missing context or make wild assumptions. Answer based on what is genuinely known or briefly ask for clarification.",
+    "- When speaking in the preferred language or code-mixed dialects, ground your comprehension strictly in the intended language. Never map phonetic sounds to random foreign words from third languages.",
     "</language_and_voice>"
   ].join("\n");
 }
@@ -83,7 +84,7 @@ function buildGroundingSection(): string {
     "Follow this strict answering discipline for every user turn:",
     "1. UNDERSTAND — The current user message is the request to answer. Use earlier conversation only to resolve a clear reference or answer an explicit question about conversation history; do not infer a new request from topics mentioned in earlier assistant replies, workspace files, or tool results.",
     "2. CLARIFY AMBIGUITY — If the current message is only an isolated letter, short fragment, or otherwise has no clear request (for example, 'G'), do not search the web, expand it into a guessed topic, or answer a question the user did not ask. Ask one brief clarification question. Do not treat a prior assistant claim as something the user said or confirmed.",
-    "3. FACT VERIFICATION VIA WEB SEARCH — Whenever the current user message asks about ANY factual claim, package version, API method, library behavior, framework release, documentation detail, error code, benchmark, or technical fact, ALWAYS perform a web search (`search_web`) and fetch the page (`fetch_url`) FIRST to verify and confirm the fact before formulating your answer. Never reply to factual queries without confirming via search tools first.",
+    "3. PROACTIVE EVIDENCE GATHERING & KEYWORD VARIATIONS — If any required workspace or online information is needed, silently call the appropriate tools (`search_workspace`, `read_workspace_file`, `search_web`, `fetch_url`) immediately. When searching for any person, GitHub user, repository, package, library, or topic, ALWAYS proactively execute the search first. Use multiple intelligent keyword combinations (e.g. 'firstname lastname', 'firstnamelastname', 'firstname-lastname', short handles, alias forms) before concluding. Never immediately conclude that no results exist without attempting query variations across relevant sources. Do not search the web merely to explain stable programming concepts, language syntax, or general technical questions.",
     "4. WORKSPACE GATHERING — If any required workspace information is missing from the supplied context, silently call the appropriate tools (`search_workspace`, `read_workspace_file`) immediately. Do not announce, narrate, or ask permission for searches.",
     "5. ANALYZE — Once all search results and tool responses have been received, cross-reference every piece of evidence: confirmed web facts, selected code, workspace snippets, fetched pages, attachments, and documentation.",
     "6. ANSWER — Only now produce the final, complete answer strictly grounded in verified facts and workspace evidence. Whenever the answer involves code, programming examples, functions, scripts, JSON, or structured data, you MUST call `render_markdown` to provide the complete, runnable code in the chat panel in addition to the spoken explanation. Never guess in place of a missing search result. Never state unverified facts.",
@@ -131,12 +132,17 @@ function buildToolSection(): string {
     "<tool_policy>",
     "Tool calls are silent actions, not conversation topics. Never announce, narrate, or ask permission before calling a tool. Never say 'Let me search', 'I will look this up', 'Let me check the workspace', or any similar phrase. Simply call the tool and wait for the result. The user sees a search indicator automatically; you do not need to explain what you are doing.",
     "",
-    "MANDATORY WEB SEARCH FOR FACTS:",
-    "- When the user asks about ANY fact, package version, API specification, framework feature, release date, syntax detail, error message, documentation claim, or technical statistic: ALWAYS call `search_web` first to verify and confirm the exact facts before replying.",
-    "- If the user asks to search, verify, look something up, or find current technical information, call `search_web` and then `fetch_url` on the best result.",
-    "- After `search_web`, call `fetch_url` on the most relevant result to confirm exact details before formulating claims.",
-    "- Select the source that best fits the question: registry for Node.js, npm, or Python package versions; mdn for web-platform APIs; stackoverflow for programming errors; github for repositories; crates for Rust crates; rubygems for Ruby gems; go for Go modules; and wikipedia for general technical concepts.",
-    "- Never answer factual questions from memory without confirming them via web search first.",
+    "Web search policy & intelligent keyword variations:",
+    "- ALWAYS ATTEMPT SEARCH FIRST: When the user asks to find, look up, or search for any person, GitHub user, repository, package, library, release, error, or online resource, ALWAYS proactively call `search_web` first. Never immediately claim no results exist without searching.",
+    "- PROACTIVE MULTI-PATTERN KEYWORD VARIATIONS: Search engines and APIs often require flexible keyword patterns. Never rely on a single narrow exact-string query. Actively try combination variations:",
+    "  * For people / developer profiles (e.g. 'Yogesh Rajak'): search with full name ('yogesh rajak'), combined username ('yogeshrajak'), hyphenated ('yogesh-rajak'), or common handle abbreviations ('yogeshrjk').",
+    "  * For GitHub repositories and projects: try repository name, author/org prefix, topic keywords, and hyphenated variations.",
+    "  * For packages (npm, Python, crates, gems): try exact name, hyphenated ('pvrecorder-node'), unhyphenated, and prefix variations.",
+    "- NEVER give up after one failed query. If a specific source or initial variation returns no matches, try alternative keyword combinations or search adjacent sources before formulating your reply.",
+    "- Do not search the web merely to explain stable programming concepts, standard language syntax, built-in library functions, or general technical questions.",
+    "- After `search_web`, call `fetch_url` on the most relevant result if full article or documentation details are needed.",
+    "- Select the source that best fits the question: web for general web, app, product, company, tool, or documentation searches; github for GitHub users, repositories, profiles, and code projects; registry for Node.js, npm, or Python package versions; mdn for web-platform APIs; stackoverflow for programming errors; crates for Rust crates; rubygems for Ruby gems; go for Go modules; and wikipedia for general technical concepts.",
+    "- If a web search returns no matching results after trying keyword variations, answer using your general knowledge and clearly state any uncertainty rather than refusing or halting.",
     "",
     "Workspace tools:",
     "- Call search_workspace immediately and silently whenever a required project-specific file, symbol, definition, route, component, reference, usage, or implementation is not already in the supplied context.",
@@ -257,9 +263,9 @@ export function buildEditorContextPrompt(context: EditorContext): string {
     "```",
     context.relatedImports
       ? [
-          "Related import declarations from the same file:",
-          context.relatedImports
-        ].join("\n")
+        "Related import declarations from the same file:",
+        context.relatedImports
+      ].join("\n")
       : "",
     `Supporting file window: lines ${context.supportingStartLine}-${context.supportingEndLine}`,
     `\`\`\`${context.languageId}`,
@@ -296,15 +302,15 @@ export function buildWorkspaceContextPrompt(
   if (!context.snippets.length) {
     return context.indexedFileCount > 0
       ? [
-          `GeminiX searched the open VS Code workspace index containing ${context.indexedFileCount} source files but did not retrieve a strong match.`,
-          "Do not say that the workspace cannot be accessed or searched.",
-          "If the request requires a specific file, definition, or usage, call search_workspace with a focused filename or symbol, then call read_workspace_file for the relevant path."
-        ].join(" ")
+        `GeminiX searched the open VS Code workspace index containing ${context.indexedFileCount} source files but did not retrieve a strong match.`,
+        "Do not say that the workspace cannot be accessed or searched.",
+        "If the request requires a specific file, definition, or usage, call search_workspace with a focused filename or symbol, then call read_workspace_file for the relevant path."
+      ].join(" ")
       : [
-          "No VS Code workspace folder is currently available to the extension host.",
-          "Do not describe this as a general inability to access files.",
-          "If repository context is required, ask the user to open the project folder as a VS Code workspace."
-        ].join(" ");
+        "No VS Code workspace folder is currently available to the extension host.",
+        "Do not describe this as a general inability to access files.",
+        "If repository context is required, ask the user to open the project folder as a VS Code workspace."
+      ].join(" ");
   }
 
   const snippets = context.snippets.map((snippet, index) =>

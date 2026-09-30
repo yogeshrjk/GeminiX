@@ -8,7 +8,7 @@ import type { ImageContext, Preferences } from "./types.js";
 
 export type { LiveFunctionResponse } from "./liveProtocol.js";
 
-const MODEL = "gemini-3.1-flash-live-preview";
+const MODEL = "gemini-3.8-live";
 const LIVE_API_ENDPOINT =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
@@ -24,11 +24,11 @@ export type LiveSessionEvent =
   | { readonly type: "debug"; readonly message: string }
   | { readonly type: "error"; readonly message: string }
   | {
-      readonly type: "closed";
-      readonly code: number;
-      readonly reason: string;
-      readonly intentional: boolean;
-    };
+    readonly type: "closed";
+    readonly code: number;
+    readonly reason: string;
+    readonly intentional: boolean;
+  };
 
 export class LiveSession {
   private socket: WebSocket | undefined;
@@ -39,7 +39,7 @@ export class LiveSession {
 
   public constructor(
     private readonly onEvent: (event: LiveSessionEvent) => void
-  ) {}
+  ) { }
 
   public get isConnected(): boolean {
     return this.socket?.readyState === WebSocket.OPEN;
@@ -336,20 +336,39 @@ export class LiveSession {
   }
 
   private createSetupMessage(preferences: Preferences): unknown {
+    const selectedModel = preferences.liveModel || MODEL;
+    const isExtendedThinking =
+      selectedModel === "gemini-3.8-live-extended-thinking";
+
+    const generationConfig: Record<string, unknown> = {
+      responseModalities: ["AUDIO"],
+      temperature: 0.3,
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: preferences.voice
+          }
+        }
+      }
+    };
+
+    if (isExtendedThinking) {
+      const level = (preferences.thinkingLevel ?? "high").toUpperCase();
+      generationConfig.thinkingConfig = {
+        thinkingLevel:
+          level === "MINIMAL" ||
+          level === "LOW" ||
+          level === "MEDIUM" ||
+          level === "HIGH"
+            ? level
+            : "HIGH"
+      };
+    }
+
     return {
       setup: {
-        model: `models/${MODEL}`,
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          temperature: 0.3,
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: preferences.voice
-              }
-            }
-          }
-        },
+        model: `models/${selectedModel}`,
+        generationConfig,
         systemInstruction: {
           parts: [{ text: buildSystemInstruction(preferences) }]
         },
@@ -417,19 +436,19 @@ export class LiveSession {
               {
                 name: "search_web",
                 description:
-                  "Search a specific web source for a topic and return a small list of matching titles and URLs. Choose the source that best fits the question: wikipedia for general topics, people, and movies; stackoverflow for programming questions and errors; mdn for web platform documentation; hackernews for tech news and discussions; github for repositories and projects; registry for the latest version of Node.js, npm packages, or Python packages; crates for Rust crates; rubygems for Ruby gems; and go for Go modules. After results return, call fetch_url on the most relevant URL to read the full content.",
+                  "Search the web or a specific source for a topic and return matching titles and URLs. Choose the source that best fits the question: web (default general search for apps, websites, companies, tools, and documentation); github for GitHub users, profiles, repositories, and projects; registry for the latest version of Node.js, npm packages, or Python packages; stackoverflow for programming questions and errors; mdn for web platform documentation; hackernews for tech news and discussions; wikipedia for general technical concepts; crates for Rust crates; rubygems for Ruby gems; and go for Go modules. Try intelligent query variations when searching. After results return, call fetch_url on the most relevant URL to read the full content.",
                 parameters: {
                   type: "OBJECT",
                   properties: {
                     query: {
                       type: "STRING",
                       description:
-                        "A concise search phrase, package name, or repository name."
+                        "A concise search phrase, app name, package name, username, or topic."
                     },
                     source: {
                       type: "STRING",
                       description:
-                        "The source to search: wikipedia, stackoverflow, mdn, hackernews, github, registry, crates, rubygems, or go. Defaults to wikipedia."
+                        "The source to search: web (general web search), github, registry, stackoverflow, mdn, hackernews, wikipedia, crates, rubygems, or go. Defaults to web."
                     }
                   },
                   required: ["query"]

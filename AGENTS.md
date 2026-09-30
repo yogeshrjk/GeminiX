@@ -14,15 +14,22 @@ The following legacy models are retired and MUST NOT be used:
 ### Supported Models
 
 - **Live Session WebSocket (`BidiGenerateContent`)**:
-  - `gemini-3.1-flash-live-preview`
-  - Endpoint: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`
-- **Document OCR / REST Extraction**:
+  - `gemini-3.1-flash-live-preview` (Conversational Multimodal Voice & Tools)
+    - Endpoint: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`
+  - `gemini-3.5-transcribe-live` (Real-Time Live Speech-to-Text Transcription)
+    - Endpoint: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent`
+- **Document OCR / REST Extraction & Transcript Reconciliation**:
   - `gemini-3.5-flash-lite` (Primary)
   - `gemini-3.1-flash-lite` (Fallback)
 
 ---
 
 ## 2. File & Image Handling Architecture
+
+### Spoken Speech-to-Text & Transcript Reconciliation
+
+- **Real-Time Live Transcription**: Spoken audio is transcribed live by `gemini-3.5-transcribe-live` via WebSocket streaming with `responseModalities: ["TEXT"]`.
+- **Automatic Transcript Reconciliation**: On voice turn completion, if any phonetic or cross-language ASR artifacts occurred, the transcript is reconciled via `gemini-3.5-flash-lite` (fallback `gemini-3.1-flash-lite`) using the assistant's grounded response and user's `preferredLanguage` to ensure clean, accurate text in the UI.
 
 ### Documents (.pdf, .xlsx, .docx, .pptx, etc.)
 

@@ -447,7 +447,8 @@ export class AttachmentStore {
 
   public async prepare(
     requestedIds: readonly string[],
-    apiKey?: string
+    apiKey?: string,
+    imageContexts: Readonly<Record<string, string>> = {}
   ): Promise<PreparedAttachments> {
     const requested = requestedIds
       .map((id) => this.attachments.get(id))
@@ -460,45 +461,63 @@ export class AttachmentStore {
 
     for (const attachment of requested) {
       if (attachment.summary.kind === "image") {
-        if (!attachment.uri) {
-          continue;
-        }
-        const bytes = await vscode.workspace.fs.readFile(attachment.uri);
-        const mimeType =
-          sniffImageMimeType(bytes) ?? attachment.mimeType ?? "image/png";
-
-        images.push({
-          data: Buffer.from(bytes).toString("base64"),
-          label: attachment.summary.label,
-          mimeType
-        });
-
-        let visionOcrText = "";
+        let imageText = "";
         if (apiKey) {
-          visionOcrText = await extractWithGoogleVision(
-            bytes,
-            mimeType,
-            attachment.summary.label,
-            "image",
-            apiKey
-          );
+          let bytes: Uint8Array | undefined;
+          if (attachment.uri) {
+            bytes = await vscode.workspace.fs.readFile(attachment.uri);
+          } else if (attachment.summary.dataUri) {
+            const base64Index = attachment.summary.dataUri.indexOf("base64,");
+            if (base64Index !== -1) {
+              const base64 = attachment.summary.dataUri.slice(base64Index + 7);
+              bytes = Buffer.from(base64, "base64");
+            }
+          }
+
+          if (bytes) {
+            const mimeType =
+              sniffImageMimeType(bytes) ??
+              attachment.mimeType ??
+              (attachment.uri
+                ? IMAGE_MIME_TYPES.get(extname(attachment.uri.path).toLowerCase())
+                : undefined) ??
+              "image/png";
+
+            imageText = await extractWithGoogleVision(
+              bytes,
+              mimeType,
+              attachment.summary.label,
+              "image",
+              apiKey
+            );
+          }
         }
 
-        if (visionOcrText) {
+        if (imageText) {
+          const acceptedText = imageText.slice(0, remainingTextCharacters);
+          remainingTextCharacters -= acceptedText.length;
           promptSections.push(
             [
-              `Attached image: ${attachment.summary.label}`,
-              "Google Vision OCR & Visual Analysis:",
-              visionOcrText
-            ].join("\n\n")
+              `Attached image (Google Vision analysis & OCR): ${attachment.summary.label}`,
+              acceptedText.length < imageText.length
+                ? "Note: The image analysis was truncated at the safe context limit."
+                : "",
+              acceptedText
+            ]
+              .filter(Boolean)
+              .join("\n\n")
           );
         } else {
-          promptSections.push(
-            [
-              `Attached image: ${attachment.summary.label}`,
-              "The image is sent as a visual frame. Inspect its visible content and use it as supporting context."
-            ].join("\n")
-          );
+          const context = imageContexts[attachment.summary.id];
+          if (context?.trim()) {
+            promptSections.push(
+              `Attached image: ${attachment.summary.label}\n${context.slice(0, 16_000)}`
+            );
+          } else {
+            promptSections.push(
+              `Attached image: ${attachment.summary.label} (Google Vision analysis pending or unavailable)`
+            );
+          }
         }
         continue;
       }
@@ -691,15 +710,17 @@ export class AttachmentStore {
     if (apiKey) {
       const bytes = await vscode.workspace.fs.readFile(attachment.uri);
       const ext = extname(attachment.uri.path).toLowerCase();
+      const isImage = IMAGE_MIME_TYPES.has(ext) || Boolean(sniffImageMimeType(bytes));
       const mimeType =
         DOCUMENT_MIME_TYPES.get(ext) ??
         IMAGE_MIME_TYPES.get(ext) ??
+        (isImage ? sniffImageMimeType(bytes) : sniffDocumentMimeType(bytes)) ??
         "application/octet-stream";
       const extracted = await extractWithGoogleVision(
         bytes,
         mimeType,
         attachment.summary.label,
-        "document",
+        isImage ? "image" : "document",
         apiKey
       );
       if (extracted) {

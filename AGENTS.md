@@ -18,7 +18,7 @@ The following legacy models are retired and MUST NOT be used:
     - Endpoint: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`
   - `gemini-3.5-transcribe-live` (Real-Time Live Speech-to-Text Transcription)
     - Endpoint: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent`
-- **Document OCR / REST Extraction & Transcript Reconciliation**:
+- **Document & Image OCR / REST Extraction & Transcript Reconciliation**:
   - `gemini-3.5-flash-lite` (Primary)
   - `gemini-3.1-flash-lite` (Fallback)
 
@@ -39,12 +39,9 @@ The following legacy models are retired and MUST NOT be used:
 
 ### Images (.png, .jpg, .jpeg, .webp)
 
-- **Local Raster-to-Text Context**: Images are decoded locally in pure JS; no
-  image bytes are sent to Gemini and no vision/OCR API is called.
-- Each attachment contributes a bounded luminance ASCII grid, sampled RGB
-  matrix, and coarse SVG colour mosaic to the ordinary `realtimeInput.text`
-  prompt. This preserves coarse layout and colour only; it is not object
-  detection, OCR, or true raster-to-vector conversion.
+- **Google Vision OCR & Visual Analysis**: Images are processed through the REST `generateContent` endpoint using `gemini-3.5-flash-lite` / `gemini-3.1-flash-lite` to extract text, code, diagrams, and visual structure into Markdown context before sending the turn.
+- Automatic retry on `503`, `500`, and `429` status codes.
+- Local fallback preview and raster context are preserved if Vision extraction is unavailable.
 
 ---
 

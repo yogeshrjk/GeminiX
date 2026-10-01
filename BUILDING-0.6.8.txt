@@ -1,0 +1,38 @@
+GeminiX 0.6.8 - Updated full source
+
+This archive contains the working source used to build the supplied 0.6.8 VSIX,
+including all new reliability modules, tests, assets, and the dependency lockfile.
+The existing UI layout and stylesheet are preserved.
+
+BUILD
+1. Extract this ZIP and open the GeminiX-0.6.8 folder in a terminal.
+2. Use Node.js 22 LTS or newer with npm.
+3. Run: npm ci
+4. Run: npm run package
+   Output: gemini-x-v0.6.8.vsix
+5. VS Code > Extensions > ... > Install from VSIX.
+
+CHECKS
+npm run check
+npm test
+npx playwright install chromium
+npm run test:ui
+
+47 unit/protocol tests and 9 browser integration tests passed in the build
+environment. Live Gemini API calls, microphone hardware, and account-specific
+model access still need verification using your own API key in VS Code.
+
+RELEASE NOTES
+- Extended Thinking uses non-blocking tools and interaction-status completion.
+- Cancelled/duplicate tool calls and stale asynchronous results are filtered.
+- General web search is the default; unavailable providers produce explicit errors.
+- Search requests have timeouts, cancellation, and bounded response sizes.
+- Processing controls recover after errors; new/restored chats reset the session.
+- Typed chat can start without opening the microphone.
+- Prompts are shorter and distinguish proposed changes from completed actions.
+- Images follow AGENTS.md: local layout/color text samples only, no raster upload
+  or image OCR. Live screen sharing is separate. Document REST extraction remains.
+
+The older README contains historical feature descriptions. This release uses
+0.6.8 and the current package scripts above. Dependencies, generated dist files,
+Git history, and local runtime captures are regenerated or unnecessary for source.

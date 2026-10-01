@@ -1,3 +1,5 @@
+import { createLocalImageContext } from "./imageContext.js";
+import { interactionStatus, isInteractionComplete } from "../src/liveInteraction.js";
 import bash from "@shikijs/langs/bash";
 import c from "@shikijs/langs/c";
 import cpp from "@shikijs/langs/cpp";
@@ -132,9 +134,13 @@ interface PendingTextSubmission {
   readonly includeCurrentPage: boolean;
   readonly currentPageUri?: string;
   readonly attachmentIds: readonly string[];
+  readonly fromEdit?: boolean;
+  readonly attachmentDisplays?: readonly AttachmentSummary[];
 }
 
 interface ServerContent {
+  readonly interactionStatus?: string;
+  readonly interaction_status?: string;
   readonly inputTranscription?: { readonly text?: string };
   readonly outputTranscription?: { readonly text?: string };
   readonly modelTurn?: {
@@ -168,6 +174,9 @@ interface GeminiToolCall {
 }
 
 interface GeminiServerMessage {
+  readonly interactionStatus?: string;
+  readonly interaction_status?: string;
+  readonly toolCallCancellation?: { readonly ids?: readonly string[] };
   readonly error?: {
     readonly message?: string;
     readonly status?: string;
@@ -189,6 +198,7 @@ interface ScreenFrame {
 }
 
 interface HostMessage {
+  readonly liveModel?: LiveModel;
   readonly type?: string;
   readonly apiConfigured?: boolean;
   readonly configured?: boolean;
@@ -344,6 +354,7 @@ function requiredElement<T extends HTMLElement>(id: string): T {
 }
 
 const elements = {
+  apiCheckingCard: requiredElement<HTMLElement>("apiCheckingCard"),
   apiKeyField: requiredElement<HTMLElement>("apiKeyField"),
   apiKeyInput: requiredElement<HTMLInputElement>("apiKeyInput"),
   apiRequiredCard: requiredElement<HTMLElement>("apiRequiredCard"),
@@ -480,12 +491,16 @@ const state = {
   activityIndicator: null as HTMLElement | null,
   saveChatTimer: undefined as number | undefined,
   sessionReady: false,
+  sessionModel: "gemini-3.8-live" as LiveModel,
   sessionStartedAt: 0,
   screenSharing: false,
   audioMuted: false,
   lastRenderedScreenKey: "",
   suppressNextResponse: false,
   isProcessing: false,
+  followTranscript: true,
+  activeTextRequestId: undefined as string | undefined,
+  submittedText: undefined as PendingTextSubmission | undefined,
   micAutoMuted: false,
   userMicMutedState: false,
   timer: undefined as number | undefined,
@@ -585,6 +600,8 @@ function clearError(): void {
 
 function updateApiStatus(configured: boolean): void {
   state.apiConfigured = configured;
+  elements.chatPanel.classList.remove("api-key-checking");
+  elements.apiCheckingCard.classList.add("hidden");
   elements.chatPanel.classList.toggle("api-key-required", !configured);
   elements.apiRequiredCard.classList.toggle("hidden", configured);
   elements.apiStatusDot.classList.toggle("is-configured", configured);
@@ -619,10 +636,14 @@ function updateThinkingLevelVisibility(): void {
   const isExtended =
     elements.modelSelect.value === "gemini-3.8-live-extended-thinking";
   elements.thinkingLevelField.classList.toggle("hidden", !isExtended);
+  const minimal = elements.thinkingLevelSelect.querySelector<HTMLOptionElement>('option[value="minimal"]');
+  if (minimal) minimal.disabled = isExtended;
+  if (isExtended && elements.thinkingLevelSelect.value === "minimal") elements.thinkingLevelSelect.value = "low";
 }
 
 function applyPreferences(preferences: Preferences): void {
   state.preferences = preferences;
+  if (!state.sessionReady && !state.isConnecting && preferences.liveModel) state.sessionModel = preferences.liveModel;
   elements.voiceSelect.value = preferences.voice;
   elements.languageSelect.value = preferences.preferredLanguage;
   if (preferences.liveModel) {
@@ -882,6 +903,7 @@ function scrollTranscriptToBottom(
   behavior: ScrollBehavior = "smooth"
 ): void {
   window.requestAnimationFrame(() => {
+    if (!state.followTranscript) return;
     elements.transcript.scrollTo({
       behavior,
       top: elements.transcript.scrollHeight
@@ -1328,6 +1350,8 @@ function regenerateUserMessage(message: TranscriptMessage): void {
     return;
   }
 
+  if (state.isProcessing) stopActiveTurn();
+  finalizeModelMessage();
   state.suppressNextResponse = false;
   state.respeakCancelled = false;
   state.activeRespeakText = "";
@@ -1342,11 +1366,10 @@ function regenerateUserMessage(message: TranscriptMessage): void {
   startProcessing(false, false);
 
   if (state.sessionReady) {
-    vscode.postMessage({
-      type: "sendText",
+    void dispatchTextSubmission({
       requestId,
       chatId,
-      value,
+      text: value,
       includeCurrentPage: false,
       currentPageUri: undefined,
       attachmentIds: [],
@@ -1361,7 +1384,8 @@ function regenerateUserMessage(message: TranscriptMessage): void {
     chatId,
     includeCurrentPage: false,
     currentPageUri: undefined,
-    attachmentIds: []
+    attachmentIds: [],
+    fromEdit: true
   };
   updateControls();
   void beginSession();
@@ -1504,6 +1528,8 @@ function sendCorrectedQuestion(text: string): void {
     return;
   }
 
+  if (state.isProcessing) stopActiveTurn();
+  finalizeModelMessage();
   state.suppressNextResponse = false;
   state.respeakCancelled = false;
   state.activeRespeakText = "";
@@ -1515,11 +1541,10 @@ function sendCorrectedQuestion(text: string): void {
   startProcessing(false, false);
 
   if (state.sessionReady) {
-    vscode.postMessage({
-      type: "sendText",
+    void dispatchTextSubmission({
       requestId,
       chatId,
-      value: trimmed,
+      text: trimmed,
       includeCurrentPage: false,
       currentPageUri: undefined,
       attachmentIds: [],
@@ -1534,7 +1559,8 @@ function sendCorrectedQuestion(text: string): void {
     chatId,
     includeCurrentPage: false,
     currentPageUri: undefined,
-    attachmentIds: []
+    attachmentIds: [],
+    fromEdit: true
   };
   updateControls();
   void beginSession();
@@ -2524,6 +2550,7 @@ function finishTranscriptTurn(): void {
     userMessage.closed = true;
   }
   if (modelMessage) {
+    modelMessage.closed = true;
     void renderModelMessage(modelMessage);
   }
   state.hasLiveTranscribeText = false;
@@ -2532,7 +2559,7 @@ function finishTranscriptTurn(): void {
 }
 
 function handleUserTranscriptChunk(text: string): void {
-  if (!text.trim() || state.isRespeaking) {
+  if (!state.sessionReady || state.micMuted || state.isProcessing || !text.trim() || state.isRespeaking) {
     return;
   }
   state.hasLiveTranscribeText = true;
@@ -2590,6 +2617,7 @@ function finalizeModelMessage(): void {
 }
 
 function resetTranscriptView(): void {
+  state.followTranscript = true;
   if (state.isRespeaking) {
     state.isRespeaking = false;
     resetRespeakButton();
@@ -2679,6 +2707,7 @@ function postActiveChat(): void {
 }
 
 function startNewChat(): void {
+  endSession();
   if (state.saveChatTimer !== undefined) {
     window.clearTimeout(state.saveChatTimer);
     state.saveChatTimer = undefined;
@@ -2695,6 +2724,10 @@ function startNewChat(): void {
 }
 
 function restoreChat(chat: StoredChat): void {
+  if (state.saveChatTimer !== undefined) window.clearTimeout(state.saveChatTimer);
+  state.saveChatTimer = undefined;
+  postActiveChat();
+  endSession();
   state.restoringChat = true;
   resetTranscriptView();
   state.activeChatId = chat.id;
@@ -2793,7 +2826,10 @@ function unmuteMicIfAutoMuted(): void {
 }
 
 function markAnswering(): void {
-  unmuteMicIfAutoMuted();
+  if (state.analyzingImage) {
+    state.analyzingImage = false;
+    unmuteMicIfAutoMuted();
+  }
   if (state.answering) {
     return;
   }
@@ -2804,6 +2840,10 @@ function markAnswering(): void {
 }
 
 function markReasoning(): void {
+  if (state.analyzingImage) {
+    state.analyzingImage = false;
+    unmuteMicIfAutoMuted();
+  }
   if (state.reasoning) {
     return;
   }
@@ -2980,9 +3020,12 @@ async function beginSession(): Promise<void> {
     state.audioContext = new AudioContext();
     await state.audioContext.resume();
     createPlaybackPipeline();
-    vscode.postMessage({ type: "startSession" });
+    vscode.postMessage({ type: "startSession", voiceEnabled: !state.pendingTextSubmission && !state.pendingRespeak });
   } catch (error) {
     state.isConnecting = false;
+    state.pendingTextSubmission = undefined;
+    endProcessing();
+    hideActivityIndicator();
     cleanupAudio();
     updateControls();
     setStatus("Could not start", "error");
@@ -3001,16 +3044,12 @@ function startProcessing(hasImages: boolean, hasDocs: boolean): void {
   state.reasoning = false;
   state.analyzingImage = hasImages;
 
-  // Auto-mute microphone ONLY when analyzing images or documents so background speech won't disrupt analysis
-  if (hasImages || hasDocs) {
+  // Keep background speech from interrupting during image analysis or submission.
+  if (!state.micAutoMuted) {
     state.micAutoMuted = true;
-    state.userMicMutedState = state.micMuted;
-    if (!state.micMuted) {
-      vscode.postMessage({ type: "muteMic", muted: true });
-    }
-  } else {
-    state.micAutoMuted = false;
+    state.userMicMutedState = state.sessionReady ? state.micMuted : false;
   }
+  if (!state.micMuted) vscode.postMessage({ type: "muteMic", muted: true });
 
   if (hasImages) {
     setActivityIndicator("image", "Analyzing image source…");
@@ -3038,25 +3077,47 @@ function endProcessing(): void {
 }
 
 function stopActiveTurn(): void {
+  state.suppressNextResponse = true;
+  state.pendingTextSubmission = undefined;
+  state.activeTextRequestId = undefined;
   stopPlayback();
   finishTranscriptTurn();
   hideActivityIndicator();
   vscode.postMessage({ type: "interruptTurn" });
   endProcessing();
-  setStatus("Listening", "live");
+  if (state.isConnecting) endSession();
+  else setStatus(state.sessionReady ? "Listening" : "Disconnected", state.sessionReady ? "live" : "idle");
 }
 
-function dispatchTextSubmission(
+async function dispatchTextSubmission(
   submission: PendingTextSubmission
-): void {
+): Promise<void> {
+  state.activeTextRequestId = submission.requestId;
+  state.submittedText = submission;
+  state.pendingTextSubmission = undefined;
+  const imageContexts: Record<string, string> = {};
+  try {
+    for (const attachment of submission.attachmentDisplays ?? []) {
+      if (attachment.kind !== "image") continue;
+      if (!attachment.dataUri) throw new Error(`The preview for ${attachment.label} is unavailable. Reattach the image.`);
+      imageContexts[attachment.id] = await createLocalImageContext(attachment.dataUri);
+    }
+  } catch (error) {
+    if (state.activeTextRequestId !== submission.requestId) return;
+    handleHostMessage({ type: "textRejected", requestId: submission.requestId, message: error instanceof Error ? error.message : "Image could not be read." });
+    return;
+  }
+  if (state.activeTextRequestId !== submission.requestId) return;
   vscode.postMessage({
     type: "sendText",
+    imageContexts,
     requestId: submission.requestId,
     chatId: submission.chatId,
     value: submission.text,
     includeCurrentPage: submission.includeCurrentPage,
     currentPageUri: submission.currentPageUri,
-    attachmentIds: submission.attachmentIds
+    attachmentIds: submission.attachmentIds,
+    fromEdit: submission.fromEdit
   });
   state.pendingTextSubmission = undefined;
   updateControls();
@@ -3107,9 +3168,11 @@ function submitTextMessage(): void {
     currentPageUri: attachedCurrentPage
       ? currentPage?.uri
       : undefined,
-    attachmentIds: currentAttachments.map((attachment) => attachment.id)
+    attachmentIds: currentAttachments.map((attachment) => attachment.id),
+    attachmentDisplays: currentAttachments
   };
 
+  state.followTranscript = true;
   // Append user message to transcript panel immediately
   appendTranscript(
     "user",
@@ -3153,7 +3216,7 @@ function submitTextMessage(): void {
 
   clearError();
   if (state.sessionReady) {
-    dispatchTextSubmission(submission);
+    void dispatchTextSubmission(submission);
     return;
   }
 
@@ -3163,6 +3226,11 @@ function submitTextMessage(): void {
 }
 
 function endSession(): void {
+  state.pendingTextSubmission = undefined;
+  state.activeTextRequestId = undefined;
+  finishTranscriptTurn();
+  endProcessing();
+  hideActivityIndicator();
   vscode.postMessage({ type: "stopSession" });
   state.isConnecting = false;
   state.sessionReady = false;
@@ -3188,12 +3256,14 @@ function isGeminiMessage(value: unknown): value is GeminiServerMessage {
 }
 
 function handleServerMessage(payload: unknown): void {
+  if (!state.sessionReady && !state.isConnecting) return;
   if (!isGeminiMessage(payload)) {
     showError("Gemini returned an unreadable message.");
     return;
   }
 
   if (payload.error) {
+    endSession();
     showError(
       payload.error.message ??
       payload.error.status ??
@@ -3219,7 +3289,7 @@ function handleServerMessage(payload: unknown): void {
       state.pendingRespeak = undefined;
     }
     if (state.pendingTextSubmission) {
-      dispatchTextSubmission(state.pendingTextSubmission);
+      void dispatchTextSubmission(state.pendingTextSubmission);
     }
     return;
   }
@@ -3322,7 +3392,15 @@ function handleServerMessage(payload: unknown): void {
       setStatus("Listening", "live");
     }
 
-    if (content.turnComplete) {
+  }
+
+  if (payload.toolCall) handleToolCall(payload.toolCall);
+  for (const id of payload.toolCallCancellation?.ids ?? []) state.handledFunctionCallIds.add(id);
+  if (interactionStatus(payload) === "IN_PROGRESS" && !state.suppressNextResponse) {
+    if (!state.isProcessing) startProcessing(false, false);
+    markReasoning();
+  }
+  if (isInteractionComplete(payload, state.sessionModel) && !state.suppressNextResponse) {
       hideActivityIndicator();
       if (state.isRespeaking) {
         state.respeakTurnComplete = true;
@@ -3338,11 +3416,6 @@ function handleServerMessage(payload: unknown): void {
         setStatus("Listening", "live");
       }
     }
-  }
-
-  if (payload.toolCall) {
-    handleToolCall(payload.toolCall);
-  }
 }
 
 function handleToolCall(toolCall: GeminiToolCall): void {
@@ -3365,7 +3438,7 @@ function handleToolCall(toolCall: GeminiToolCall): void {
 
     const markdown = functionCall.args?.["markdown"];
     const renderResult =
-      typeof markdown === "string"
+      !state.suppressNextResponse && typeof markdown === "string"
         ? appendMarkdownBlock(markdown, functionCallId)
         : "invalid";
 
@@ -3602,6 +3675,9 @@ function handleHostMessage(message: HostMessage): void {
       elements.settingsFeedback.classList.remove("hidden");
       break;
     case "apiRequired":
+      state.pendingTextSubmission = undefined;
+      endProcessing();
+      hideActivityIndicator();
       updateApiStatus(false);
       state.isConnecting = false;
       resetScreenSharing();
@@ -3624,6 +3700,9 @@ function handleHostMessage(message: HostMessage): void {
       }
       break;
     case "preferencesSaved":
+      finishTranscriptTurn();
+      endProcessing();
+      hideActivityIndicator();
       if (message.preferences) {
         applyPreferences(message.preferences);
       }
@@ -3650,6 +3729,12 @@ function handleHostMessage(message: HostMessage): void {
       )}%`;
       break;
     }
+    case "microphoneUnavailable":
+      state.micMuted = true;
+      state.userMicMutedState = true;
+      if (message.message) showError(message.message);
+      updateControlIcons();
+      break;
     case "micMuted":
       state.micMuted = Boolean(message.muted);
       elements.muteMicButton.classList.toggle("is-muted", state.micMuted);
@@ -3666,7 +3751,12 @@ function handleHostMessage(message: HostMessage): void {
       }
       break;
     case "sessionConnecting":
+      state.isConnecting = true;
+      state.sessionReady = false;
       setStatus("Connecting", "busy");
+      break;
+    case "sessionModel":
+      if (message.liveModel) state.sessionModel = message.liveModel;
       break;
     case "sessionOpened":
       setStatus("Configuring Gemini", "busy");
@@ -3724,6 +3814,9 @@ function handleHostMessage(message: HostMessage): void {
       }
       break;
     case "sessionError":
+      finishTranscriptTurn();
+      endProcessing();
+      state.activeTextRequestId = undefined;
       state.pendingTextSubmission = undefined;
       state.pendingRespeak = undefined;
       state.isConnecting = false;
@@ -3746,6 +3839,9 @@ function handleHostMessage(message: HostMessage): void {
       }
       break;
     case "sessionClosed":
+      finishTranscriptTurn();
+      endProcessing();
+      state.activeTextRequestId = undefined;
       state.pendingTextSubmission = undefined;
       state.pendingRespeak = undefined;
       state.isConnecting = false;
@@ -3787,6 +3883,9 @@ function handleHostMessage(message: HostMessage): void {
       }
       break;
     case "sessionStopped":
+      finishTranscriptTurn();
+      endProcessing();
+      state.activeTextRequestId = undefined;
       state.pendingTextSubmission = undefined;
       state.pendingRespeak = undefined;
       state.isConnecting = false;
@@ -3803,7 +3902,15 @@ function handleHostMessage(message: HostMessage): void {
       setStatus("Disconnected");
       break;
     case "textAccepted": {
+      if (message.requestId && message.requestId !== state.activeTextRequestId) break;
+      state.submittedText = undefined;
       state.pendingModelApplyTargetId = message.applyTargetId;
+      state.analyzingImage = false;
+      unmuteMicIfAutoMuted();
+      if (state.activeSearches === 0 && !state.answering && !state.reasoning) {
+        setActivityIndicator("lightbulb", "Thinking…");
+        setStatus("Thinking", "busy");
+      }
       if (message.attachmentDisplays?.length) {
         const userMessages =
           elements.transcript.querySelectorAll<HTMLElement>(".message.user");
@@ -3841,6 +3948,14 @@ function handleHostMessage(message: HostMessage): void {
       break;
     }
     case "textRejected":
+      if (message.requestId && message.requestId !== state.activeTextRequestId) break;
+      if (!elements.textInput.value && state.submittedText) {
+        elements.textInput.value = state.submittedText.text;
+        resizeComposer();
+      }
+      state.submittedText = undefined;
+      state.activeTextRequestId = undefined;
+      state.pendingTextSubmission = undefined;
       endProcessing();
       hideActivityIndicator();
       showError(message.message ?? "The message could not be sent.");
@@ -3853,6 +3968,7 @@ function handleHostMessage(message: HostMessage): void {
       state.suppressNextResponse = false;
       break;
     case "workspaceSearchStarted":
+      if (state.suppressNextResponse || !state.sessionReady) break;
       showActivitySearch(
         message.kind === "reading"
           ? "reading"
@@ -3870,6 +3986,7 @@ function handleHostMessage(message: HostMessage): void {
       );
       break;
     case "workspaceSearchCompleted":
+      if (state.suppressNextResponse || !state.sessionReady) break;
       completeActivitySearch();
       setStatus("Thinking", "busy");
       break;
@@ -4117,7 +4234,8 @@ elements.muteMicButton.addEventListener("click", () => {
   updateControlIcons();
   vscode.postMessage({
     type: "muteMic",
-    muted: state.micMuted
+    muted: state.micMuted,
+    voiceEnabled: true
   });
   if (state.micMuted) {
     state.micLevel = 0;
@@ -4164,19 +4282,7 @@ elements.shareScreenButton.addEventListener("click", () => {
   );
 });
 
-elements.stopPlaybackButton.addEventListener("click", () => {
-  // Stop local playback immediately.
-  stopPlayback();
-  // Suppress the server's follow-up response so Gemini stays silent
-  // until the user speaks again.
-  state.suppressNextResponse = true;
-  // Commit the partial answer and close the current turn so the next
-  // question renders as its own bubble instead of merging.
-  finishTranscriptTurn();
-  setStatus("Listening", "live");
-  // Tell the server to interrupt the current turn.
-  vscode.postMessage({ type: "interruptTurn" });
-});
+elements.stopPlaybackButton.addEventListener("click", stopActiveTurn);
 
 elements.saveApiButton.addEventListener("click", () => {
   submitApiKey(elements.apiKeyInput, elements.settingsFeedback);
@@ -4238,11 +4344,7 @@ elements.debugClearButton.addEventListener("click", () => {
   elements.debugBadge.classList.add("hidden");
 });
 
-elements.modelSelect.addEventListener("change", () => {
-  updateThinkingLevelVisibility();
-});
-
-elements.savePreferencesButton.addEventListener("click", () => {
+function collectCurrentPreferences(): Preferences {
   const behaviorValue = elements.behaviorSelect.value;
   const behavior: Behavior =
     behaviorValue === "friendly" || behaviorValue === "expert"
@@ -4265,7 +4367,7 @@ elements.savePreferencesButton.addEventListener("click", () => {
       ? thinkingLevelValue
       : "high";
 
-  const preferences: Preferences = {
+  return {
     voice: elements.voiceSelect.value,
     preferredLanguage: elements.languageSelect.value,
     autoInterrupt: elements.autoInterruptInput.checked,
@@ -4273,9 +4375,49 @@ elements.savePreferencesButton.addEventListener("click", () => {
     liveModel,
     thinkingLevel
   };
-  elements.settingsFeedback.classList.add("hidden");
+}
+
+function persistPreferences(showFeedback = false): void {
+  const preferences = collectCurrentPreferences();
+  state.preferences = preferences;
+  if (showFeedback) {
+    elements.settingsFeedback.classList.add("hidden");
+  }
   vscode.postMessage({ type: "savePreferences", preferences });
+}
+
+elements.voiceSelect.addEventListener("change", () => {
+  persistPreferences(false);
 });
+
+elements.languageSelect.addEventListener("change", () => {
+  persistPreferences(false);
+});
+
+elements.behaviorSelect.addEventListener("change", () => {
+  persistPreferences(false);
+});
+
+elements.modelSelect.addEventListener("change", () => {
+  updateThinkingLevelVisibility();
+  persistPreferences(false);
+});
+
+elements.thinkingLevelSelect.addEventListener("change", () => {
+  persistPreferences(false);
+});
+
+elements.autoInterruptInput.addEventListener("change", () => {
+  persistPreferences(false);
+});
+
+elements.savePreferencesButton.addEventListener("click", () => {
+  persistPreferences(true);
+});
+
+elements.transcript.addEventListener("scroll", () => {
+  state.followTranscript = elements.transcript.scrollHeight - elements.transcript.scrollTop - elements.transcript.clientHeight < 80;
+}, { passive: true });
 
 elements.textForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -4297,6 +4439,7 @@ elements.textInput.addEventListener("blur", () => {
 });
 
 elements.textInput.addEventListener("keydown", (event) => {
+  if (event.isComposing) return;
   if (!elements.mentionMenu.classList.contains("hidden")) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -4313,12 +4456,12 @@ elements.textInput.addEventListener("keydown", (event) => {
 
   if (
     event.key !== "Enter" ||
-    event.shiftKey ||
-    event.isComposing
+    event.shiftKey
   ) {
     return;
   }
 
+  if (state.isProcessing) return;
   event.preventDefault();
   elements.textForm.requestSubmit();
 });

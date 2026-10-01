@@ -4,6 +4,46 @@ export interface LiveFunctionResponse {
   readonly response: Readonly<Record<string, unknown>>;
 }
 
+export interface LiveFunctionCall {
+  readonly id: string;
+  readonly name: string;
+  readonly args?: Readonly<Record<string, unknown>>;
+}
+
+/** Owns call IDs for one socket: cancelled and completed calls cannot reply. */
+export class LiveToolCalls {
+  private readonly pending = new Map<string, string>();
+  private readonly seen = new Set<string>();
+
+  public accept(calls: readonly unknown[]): readonly LiveFunctionCall[] {
+    return calls.filter((value): value is LiveFunctionCall => {
+      if (typeof value !== "object" || value === null) return false;
+      const call = value as Partial<LiveFunctionCall>;
+      if (typeof call.id !== "string" || !call.id.trim() || typeof call.name !== "string" || !call.name.trim() || this.seen.has(call.id)) return false;
+      this.seen.add(call.id);
+      this.pending.set(call.id, call.name);
+      return true;
+    });
+  }
+
+  public has(id: string): boolean { return this.pending.has(id); }
+
+  public complete(responses: readonly LiveFunctionResponse[]): readonly LiveFunctionResponse[] {
+    return responses.filter((response) => {
+      if (this.pending.get(response.id) !== response.name) return false;
+      this.pending.delete(response.id);
+      return true;
+    });
+  }
+
+  public cancel(ids?: readonly string[]): void {
+    if (ids) ids.forEach((id) => this.pending.delete(id));
+    else this.pending.clear();
+  }
+
+  public reset(): void { this.pending.clear(); this.seen.clear(); }
+}
+
 export interface LiveToolResponsePayload {
   readonly toolResponse: {
     readonly functionResponses: readonly LiveFunctionResponse[];

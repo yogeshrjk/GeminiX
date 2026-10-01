@@ -1,3 +1,4 @@
+import { createWebTools } from "./webTools.js";
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { AttachmentStore } from "./attachments.js";
@@ -37,6 +38,7 @@ interface WebviewMessage {
   readonly text?: string;
   readonly url?: string;
   readonly muted?: boolean;
+  readonly voiceEnabled?: boolean;
   readonly requestId?: string;
   readonly actionId?: string;
   readonly code?: string;
@@ -47,6 +49,7 @@ interface WebviewMessage {
   readonly includeCurrentPage?: boolean;
   readonly currentPageUri?: string;
   readonly attachmentIds?: readonly string[];
+  readonly imageContexts?: Readonly<Record<string, string>>;
   readonly preferences?: Preferences;
   readonly functionResponse?: unknown;
   readonly enabled?: boolean;
@@ -84,7 +87,6 @@ interface ScreenFrame {
 const MAX_APPLY_TARGETS = 20;
 const MAX_PATCH_CHARACTERS = 1_000_000;
 const MAX_WORKSPACE_TOOL_CALLS_PER_TURN = 8;
-const MAX_URL_TEXT_CHARS = 60_000;
 
 class GeminiXViewProvider
   implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -103,6 +105,15 @@ class GeminiXViewProvider
   private screenShareTimer: NodeJS.Timeout | undefined;
   private lastScreenFrameKey = "";
   private sessionHistorySeeded = false;
+  private turnGeneration = 0;
+  private sessionGeneration = 0;
+  private readonly toolRequests = new Map<string, AbortController>();
+
+  private cancelPendingTurn(): void {
+    this.turnGeneration += 1;
+    for (const request of this.toolRequests.values()) request.abort();
+    this.toolRequests.clear();
+  }
 
   private async openFile(
     filePath: string | undefined,
@@ -137,7 +148,9 @@ class GeminiXViewProvider
       return;
     }
     try {
-      void vscode.env.openExternal(vscode.Uri.parse(url));
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return;
+      void vscode.env.openExternal(vscode.Uri.parse(parsed.href));
     } catch {
       vscode.window.showErrorMessage(`Could not open URL: ${url}`);
     }
@@ -343,7 +356,7 @@ class GeminiXViewProvider
           await this.updatePreferences(message.preferences);
           break;
         case "startSession":
-          await this.startSession();
+          await this.startSession(message.voiceEnabled ?? true);
           break;
         case "stopSession":
           this.stopSession();
@@ -356,7 +369,8 @@ class GeminiXViewProvider
             message.includeCurrentPage,
             message.currentPageUri,
             message.attachmentIds,
-            message.fromEdit
+            message.fromEdit,
+            message.imageContexts
           );
           break;
         case "pickFileAttachments":
@@ -392,6 +406,14 @@ class GeminiXViewProvider
           break;
         case "muteMic":
           this.micMuted = Boolean(message.muted);
+          if (this.micMuted) {
+            this.session?.sendAudioStreamEnd();
+            this.transcribeSession?.sendAudioStreamEnd();
+          }
+          if (!this.micMuted && !this.microphone) {
+            const apiKey = await this.secrets.get(API_KEY_SECRET);
+            if (apiKey && this.session?.isConnected) this.startMicrophone(apiKey);
+          }
           this.post({
             type: "micMuted",
             muted: this.micMuted,
@@ -399,6 +421,7 @@ class GeminiXViewProvider
           });
           break;
         case "interruptTurn":
+          this.cancelPendingTurn();
           this.session?.sendInterrupt();
           break;
         case "sendToolResponse":
@@ -435,7 +458,8 @@ class GeminiXViewProvider
       }
     } catch (error) {
       this.post({
-        type: "hostError",
+        type: message.type === "sendText" ? "textRejected" : "hostError",
+        requestId: message.requestId,
         message:
           error instanceof Error
             ? error.message
@@ -486,13 +510,15 @@ class GeminiXViewProvider
       preferences: savedPreferences,
     });
 
-    if (this.session?.isConnected) {
-      await this.startSession();
+    if (this.session) {
+      await this.startSession(!this.micMuted);
     }
   }
 
-  private async startSession(): Promise<void> {
+  private async startSession(voiceEnabled = true): Promise<void> {
+    const generation = ++this.sessionGeneration;
     const apiKey = await this.secrets.get(API_KEY_SECRET);
+    if (generation !== this.sessionGeneration) return;
     if (!apiKey) {
       this.post({ type: "apiRequired" });
       return;
@@ -500,10 +526,21 @@ class GeminiXViewProvider
 
     this.disposeLiveResources();
     this.sessionHistorySeeded = false;
-    this.session = new LiveSession((event) => {
-      this.handleSessionEvent(event);
+    const preferences = readPreferences();
+    this.post({ type: "sessionModel", liveModel: preferences.liveModel });
+    const session = new LiveSession((event) => {
+      if (this.session === session) this.handleSessionEvent(event);
     });
+    this.session = session;
+    if (voiceEnabled) this.startMicrophone(apiKey);
+    else {
+      this.micMuted = true;
+      this.post({ type: "micMuted", muted: true });
+    }
+    session.connect(apiKey, preferences);
+  }
 
+  private startMicrophone(apiKey: string): void {
     this.transcribeSession = new TranscribeLiveSession({
       onTranscriptChunk: (text) => {
         this.post({ type: "userTranscriptChunk", text });
@@ -531,33 +568,33 @@ class GeminiXViewProvider
           this.post({ type: "microphoneLevel", level });
         },
         onSpeechStart: () => {
-          void this.sendVoiceContext();
+          if (!this.micMuted) void this.sendVoiceContext();
         },
         onError: (message) => {
-          this.post({ type: "sessionError", message });
-          this.stopSession();
+          this.micMuted = true;
+          this.microphone?.dispose();
+          this.microphone = undefined;
+          this.transcribeSession?.dispose();
+          this.transcribeSession = undefined;
+          this.post({ type: "microphoneUnavailable", message });
         },
       });
       this.microphone.start();
-      this.session.connect(apiKey, readPreferences());
       this.transcribeSession.connect(apiKey);
     } catch (error) {
-      this.disposeLiveResources();
-      // Report through the normal session-error path instead of throwing:
-      // a hostError would leave the webview stuck on "Requesting
-      // microphone" with a disabled Start button (isConnecting stays true)
-      // until the extension or window is reloaded.
-      this.post({
-        type: "sessionError",
-        message:
-          error instanceof Error
-            ? `Could not open the default microphone: ${error.message}`
-            : "Could not open the default microphone.",
-      });
+      this.microphone?.dispose();
+      this.microphone = undefined;
+      this.transcribeSession.dispose();
+      this.transcribeSession = undefined;
+      this.micMuted = true;
+      this.post({ type: "microphoneUnavailable", message: error instanceof Error
+        ? `Microphone unavailable: ${error.message}. Typed chat is still available.`
+        : "Microphone unavailable. Typed chat is still available." });
     }
   }
 
   private stopSession(): void {
+    this.sessionGeneration += 1;
     this.disposeLiveResources();
     this.post({ type: "sessionStopped" });
   }
@@ -620,6 +657,7 @@ class GeminiXViewProvider
     // not re-encode and re-upload identical screenshots every second.
     const key = [
       document.uri.toString(),
+      document.version,
       startLine,
       endLine,
       frame.text.length,
@@ -653,13 +691,15 @@ class GeminiXViewProvider
     currentPageUri: string | undefined,
     attachmentIds: readonly string[] | undefined,
     fromEdit: boolean | undefined,
+    imageContexts: Readonly<Record<string, string>> | undefined,
   ): Promise<void> {
+    const session = this.session;
     const userText = text?.trim() ?? "";
     const requestedAttachmentIds = attachmentIds ?? [];
     const hasAttachments =
       requestedAttachmentIds.length > 0 || Boolean(includeCurrentPage);
 
-    if ((!userText && !hasAttachments) || !this.session?.isConnected) {
+    if ((!userText && !hasAttachments) || !session?.isConnected) {
       this.post({
         type: "textRejected",
         requestId,
@@ -668,6 +708,9 @@ class GeminiXViewProvider
       return;
     }
 
+    this.cancelPendingTurn();
+    const generation = this.turnGeneration;
+    const isCurrent = () => session === this.session && generation === this.turnGeneration && session.isConnected;
     const context = captureEditorContext();
     if (
       context &&
@@ -677,6 +720,7 @@ class GeminiXViewProvider
     ) {
       this.post({
         type: "selectedCodeResponse",
+        requestId,
         codeText: context.text,
         languageId: context.languageId
       });
@@ -693,23 +737,14 @@ class GeminiXViewProvider
     const preparedAttachments = await this.attachmentStore.prepare(
       requestedAttachmentIds,
       apiKey,
+      imageContexts,
     );
 
+    if (!isCurrent()) return;
     const displayAttachments = await this.attachmentStore.displayInfo(
       requestedAttachmentIds,
     );
-    this.post({
-      type: "textAccepted",
-      requestId,
-      text: userText,
-      context: summarizeEditorContext(context),
-      currentPage: summarizeCurrentPage(currentPageContext),
-      applyTargetId,
-      attachments: requestedAttachmentIds,
-      attachmentDisplays: displayAttachments,
-      hasImages: preparedAttachments.images.length > 0,
-      fromEdit
-    });
+    if (!isCurrent()) return;
 
     const announceSearch = shouldAnnounceWorkspaceSearch(userText);
     if (announceSearch) {
@@ -725,6 +760,7 @@ class GeminiXViewProvider
       userText,
       context,
     );
+    if (!isCurrent()) return;
     if (announceSearch) {
       this.postWorkspaceSearchCompleted(requestId, workspaceContext);
     }
@@ -735,7 +771,6 @@ class GeminiXViewProvider
     // burns API quota. Seed the history only once, on the first user turn of
     // a session, and only when the chat is a restored one with prior messages.
     const isFirstSessionTurn = !this.sessionHistorySeeded;
-    this.sessionHistorySeeded = true;
     const conversation = await this.chatHistory.conversationContext(chatId);
     const conversationPrompt =
       isFirstSessionTurn && conversation.length > 0
@@ -749,9 +784,9 @@ class GeminiXViewProvider
       preparedAttachments.prompt,
       conversationPrompt,
     );
-    const session = this.session;
+    if (!isCurrent()) return;
     if (
-      !session.sendUserTurn(prompt, preparedAttachments.images) ||
+      !session.sendUserTurn(prompt) ||
       session !== this.session
     ) {
       this.post({
@@ -762,6 +797,19 @@ class GeminiXViewProvider
       return;
     }
 
+    this.sessionHistorySeeded = true;
+    this.post({
+      type: "textAccepted",
+      requestId,
+      text: userText,
+      context: summarizeEditorContext(context),
+      currentPage: summarizeCurrentPage(currentPageContext),
+      applyTargetId,
+      attachments: requestedAttachmentIds,
+      attachmentDisplays: displayAttachments,
+      hasImages: displayAttachments.some((attachment) => attachment.kind === "image"),
+      fromEdit
+    });
     this.attachmentStore.release(requestedAttachmentIds);
     this.postAttachmentState();
   }
@@ -777,7 +825,8 @@ class GeminiXViewProvider
     }
 
     const session = this.session;
-    const sent = Boolean(session?.sendToolResponses([functionResponse]));
+    if (!session?.isToolCallPending(functionResponse.id)) return;
+    const sent = session.sendToolResponses([functionResponse]);
     this.post({
       type: "toolResponseStatus",
       functionCallId: functionResponse.id,
@@ -886,6 +935,8 @@ class GeminiXViewProvider
   }
 
   private async sendVoiceContext(): Promise<void> {
+    this.cancelPendingTurn();
+    const generation = this.turnGeneration;
     const context = captureEditorContext();
     const session = this.session;
     this.turnPrimaryContext = context;
@@ -895,7 +946,7 @@ class GeminiXViewProvider
         "",
         context,
       );
-      if (session !== this.session || !this.session.isConnected) {
+      if (session !== this.session || generation !== this.turnGeneration || !this.session.isConnected) {
         return;
       }
 
@@ -927,16 +978,22 @@ class GeminiXViewProvider
         this.post({ type: "sessionOpened" });
         break;
       case "serverMessage":
-        void this.handleWorkspaceToolCalls(event.payload);
+        void this.handleWorkspaceToolCalls(event.payload).catch((error: unknown) => {
+          this.post({ type: "debugLog", message: error instanceof Error ? error.message : "Tool handling failed." });
+        });
         this.post({ type: "serverMessage", payload: event.payload });
         break;
       case "debug":
         this.post({ type: "debugLog", message: event.message });
         break;
       case "error":
+        this.disposeLiveResources();
         this.post({ type: "sessionError", message: event.message });
         break;
       case "closed":
+        this.cancelPendingTurn();
+        this.transcribeSession?.dispose();
+        this.transcribeSession = undefined;
         this.stopScreenSharing();
         this.microphone?.dispose();
         this.microphone = undefined;
@@ -952,6 +1009,8 @@ class GeminiXViewProvider
   }
 
   private disposeLiveResources(): void {
+    this.sessionGeneration += 1;
+    this.cancelPendingTurn();
     this.stopScreenSharing();
     this.microphone?.dispose();
     this.microphone = undefined;
@@ -1116,6 +1175,17 @@ class GeminiXViewProvider
   }
 
   private async handleWorkspaceToolCalls(payload: unknown): Promise<void> {
+    const content = (payload as { serverContent?: { interrupted?: boolean } } | null)?.serverContent;
+    if (content?.interrupted) {
+      for (const request of this.toolRequests.values()) request.abort();
+    }
+    const cancellation = (payload as { toolCallCancellation?: { ids?: readonly string[] } } | null)?.toolCallCancellation;
+    for (const id of cancellation?.ids ?? []) this.toolRequests.get(id)?.abort();
+    await Promise.all(getToolFunctionCalls(payload).map((call) => this.handleWorkspaceToolCall(call)));
+  }
+
+  private async handleWorkspaceToolCall(call: LiveToolFunctionCall): Promise<void> {
+    const payload = { toolCall: { functionCalls: [call] } };
     const functionCalls = getToolFunctionCalls(payload);
     const session = this.session;
     if (!functionCalls.length || !session?.isConnected) {
@@ -1126,7 +1196,7 @@ class GeminiXViewProvider
     for (const functionCall of functionCalls) {
       const id = functionCall.id;
       const name = functionCall.name;
-      if (!id || !name) {
+      if (!id || !name || !session.isToolCallPending(id)) {
         continue;
       }
 
@@ -1149,6 +1219,9 @@ class GeminiXViewProvider
         continue;
       }
       this.workspaceToolCallsThisTurn += 1;
+      const controller = new AbortController();
+      this.toolRequests.set(id, controller);
+      const { fetchUrlAsText, searchWebSource } = createWebTools({ signal: controller.signal });
 
       if (name === "search_workspace") {
         const query = getStringArgument(functionCall.args, "query");
@@ -1173,6 +1246,7 @@ class GeminiXViewProvider
               query,
               this.turnPrimaryContext,
             );
+          if (session !== this.session || !session.isToolCallPending(id)) continue;
           this.postWorkspaceSearchCompleted(id, workspaceContext);
           responses.push({
             id,
@@ -1188,6 +1262,9 @@ class GeminiXViewProvider
             },
           });
         } catch (error) {
+          if (session === this.session && session.isToolCallPending(id)) {
+            this.post({ type: "workspaceSearchCompleted", requestId: id, message: "The lookup could not be completed." });
+          }
           responses.push({
             id,
             name,
@@ -1227,6 +1304,7 @@ class GeminiXViewProvider
             getNumberArgument(functionCall.args, "start_line"),
             getNumberArgument(functionCall.args, "end_line"),
           );
+          if (session !== this.session || !session.isToolCallPending(id)) continue;
           this.post({
             type: "workspaceSearchCompleted",
             requestId: id,
@@ -1239,6 +1317,9 @@ class GeminiXViewProvider
             response: { file },
           });
         } catch (error) {
+          if (session === this.session && session.isToolCallPending(id)) {
+            this.post({ type: "workspaceSearchCompleted", requestId: id, message: "The lookup could not be completed." });
+          }
           responses.push({
             id,
             name,
@@ -1272,6 +1353,7 @@ class GeminiXViewProvider
         });
         try {
           const page = await fetchUrlAsText(url);
+          if (session !== this.session || !session.isToolCallPending(id)) continue;
           this.post({
             type: "workspaceSearchCompleted",
             requestId: id,
@@ -1288,6 +1370,9 @@ class GeminiXViewProvider
             },
           });
         } catch (error) {
+          if (session === this.session && session.isToolCallPending(id)) {
+            this.post({ type: "workspaceSearchCompleted", requestId: id, message: "The lookup could not be completed." });
+          }
           responses.push({
             id,
             name,
@@ -1313,7 +1398,7 @@ class GeminiXViewProvider
           continue;
         }
         const source =
-          getStringArgument(functionCall.args, "source") ?? "wikipedia";
+          getStringArgument(functionCall.args, "source") ?? "web";
 
         this.post({
           type: "workspaceSearchStarted",
@@ -1323,6 +1408,7 @@ class GeminiXViewProvider
         });
         try {
           const results = await searchWebSource(query, source);
+          if (session !== this.session || !session.isToolCallPending(id)) continue;
           this.post({
             type: "workspaceSearchCompleted",
             requestId: id,
@@ -1343,6 +1429,9 @@ class GeminiXViewProvider
             },
           });
         } catch (error) {
+          if (session === this.session && session.isToolCallPending(id)) {
+            this.post({ type: "workspaceSearchCompleted", requestId: id, message: "The lookup could not be completed." });
+          }
           responses.push({
             id,
             name,
@@ -1364,6 +1453,7 @@ class GeminiXViewProvider
       });
     }
 
+    if (call.id) this.toolRequests.delete(call.id);
     if (responses.length && session === this.session) {
       if (!session.sendToolResponses(responses)) {
         this.post({
@@ -1430,8 +1520,15 @@ class GeminiXViewProvider
 <body>
   <div class="app-shell">
     <main class="app-main">
-      <section id="chatPanel" class="panel is-active api-key-required" aria-label="Chat">
-        <section id="apiRequiredCard" class="api-setup-screen" aria-labelledby="apiSetupTitle">
+      <section id="chatPanel" class="panel is-active api-key-checking" aria-label="Chat">
+        <section id="apiCheckingCard" class="api-checking-screen" aria-label="Checking API key">
+          <div class="api-checking-content">
+            <img class="api-setup-logo api-checking-logo" src="${logoUri.toString()}" alt="GeminiX">
+            <div class="api-checking-spinner" aria-hidden="true"></div>
+            <p class="api-checking-text">Checking API key…</p>
+          </div>
+        </section>
+        <section id="apiRequiredCard" class="api-setup-screen hidden" aria-labelledby="apiSetupTitle">
           <div class="api-setup-content">
             <img class="api-setup-logo" src="${logoUri.toString()}" alt="GeminiX">
             <p class="api-setup-eyebrow">One-time setup</p>
@@ -1649,7 +1746,7 @@ class GeminiXViewProvider
             <select id="modelSelect">
               <option value="gemini-3.8-live">Gemini 3.8 Live (Default)</option>
               <option value="gemini-3.1-flash-live-preview">Gemini 3.1 Flash Live</option>
-              <option value="gemini-3.8-live-extended-thinking">Gemini 3.8 Live Extended Thinking (Not working properly, recommended using 3.8 Live)</option>
+              <option value="gemini-3.8-live-extended-thinking">Gemini 3.8 Live Extended Thinking</option>
             </select>
           </label>
           <label id="thinkingLevelField" class="field hidden">
@@ -1759,727 +1856,6 @@ function shouldAnnounceWorkspaceSearch(userText: string): boolean {
 
 function displayFileName(filePath: string): string {
   return filePath.split(/[\\/]/u).pop() ?? filePath;
-}
-
-const GITHUB_REPO_URL = /^https?:\/\/github\.com\/([^/?#]+)\/([^/?#]+)/i;
-
-function extractHtmlTextAndMeta(html: string): { title: string; text: string } {
-  const title =
-    /<title[^>]*>([^<]*)<\/title>/i.exec(html)?.[1]?.trim() ||
-    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i
-      .exec(html)?.[1]
-      ?.trim() ||
-    /<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']*)["']/i
-      .exec(html)?.[1]
-      ?.trim() ||
-    "";
-
-  const metaDescriptions: string[] = [];
-  const ogDesc =
-    /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i
-      .exec(html)?.[1]
-      ?.trim();
-  const metaDesc =
-    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i
-      .exec(html)?.[1]
-      ?.trim();
-  const twitterDesc =
-    /<meta[^>]+name=["']twitter:description["'][^>]+content=["']([^"']*)["']/i
-      .exec(html)?.[1]
-      ?.trim();
-  const siteName =
-    /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']*)["']/i
-      .exec(html)?.[1]
-      ?.trim();
-
-  if (siteName) {
-    metaDescriptions.push(`Website: ${siteName}`);
-  }
-  if (metaDesc) {
-    metaDescriptions.push(`Description: ${metaDesc}`);
-  } else if (ogDesc) {
-    metaDescriptions.push(`Description: ${ogDesc}`);
-  }
-  if (twitterDesc && twitterDesc !== metaDesc && twitterDesc !== ogDesc) {
-    metaDescriptions.push(`Summary: ${twitterDesc}`);
-  }
-
-  const bodyText = stripHtml(html);
-  const metaHeader =
-    metaDescriptions.length > 0 ? `${metaDescriptions.join("\n")}\n\n` : "";
-  const combinedText = `${metaHeader}${bodyText}`.trim();
-
-  return { title, text: combinedText };
-}
-
-async function fetchUrlAsText(url: string): Promise<{
-  title: string;
-  text: string;
-  truncated: boolean;
-}> {
-  const { body, contentType } = await fetchWithTimeout(url);
-  let title = url;
-  let text = body;
-
-  if (contentType.includes("text/html") || body.includes("<html") || body.includes("<title")) {
-    const extracted = extractHtmlTextAndMeta(body);
-    title = extracted.title || url;
-    text = extracted.text;
-  }
-
-  const repoMatch = GITHUB_REPO_URL.exec(url);
-  if (repoMatch?.[1] && repoMatch[2]) {
-    const readme = await fetchRawReadme(
-      repoMatch[1],
-      repoMatch[2].replace(/\.git$/i, ""),
-    );
-    if (readme) {
-      text = `${text}\n\n--- RAW README ---\n${readme}`;
-    }
-  }
-
-  const truncated = text.length > MAX_URL_TEXT_CHARS;
-  if (truncated) {
-    text = `${text.slice(0, MAX_URL_TEXT_CHARS)}\n…[content truncated for length]`;
-  }
-  return { title, text, truncated };
-}
-
-async function fetchWithTimeout(url: string): Promise<{
-  body: string;
-  contentType: string;
-}> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, 15_000);
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,text/plain,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    }
-    return {
-      body: await response.text(),
-      contentType: response.headers.get("content-type") ?? "",
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function stripHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-async function fetchRawReadme(
-  owner: string,
-  repo: string,
-): Promise<string | undefined> {
-  for (const candidate of [
-    `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/README.md`,
-    `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/README.rst`,
-    `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/readme.md`,
-  ]) {
-    try {
-      const { body } = await fetchWithTimeout(candidate);
-      if (!body.startsWith("404:")) {
-        return body;
-      }
-    } catch {
-      // Try the next README candidate.
-    }
-  }
-  return undefined;
-}
-
-const WIKIPEDIA_SEARCH_URL =
-  "https://en.wikipedia.org/w/api.php?action=query&list=search&srlimit=5&format=json&formatversion=2";
-
-interface WebSearchResult {
-  readonly title: string;
-  readonly url: string;
-  readonly description: string;
-}
-
-async function searchWikipedia(
-  query: string,
-): Promise<readonly WebSearchResult[]> {
-  const { body } = await fetchWithTimeout(
-    `${WIKIPEDIA_SEARCH_URL}&srsearch=${encodeURIComponent(query)}`,
-  );
-  const data: unknown = JSON.parse(body);
-  if (typeof data !== "object" || data === null) {
-    return [];
-  }
-  const search = (data as { query?: { search?: unknown } }).query?.search;
-  if (!Array.isArray(search)) {
-    return [];
-  }
-  return search
-    .map((item): WebSearchResult | undefined => {
-      const record = item as { title?: unknown; snippet?: unknown };
-      const title = typeof record.title === "string" ? record.title : "";
-      if (!title) {
-        return undefined;
-      }
-      return {
-        title,
-        url: `https://en.wikipedia.org/wiki/${encodeURIComponent(
-          title.replace(/ /g, "_"),
-        )}`,
-        description: stripHtml(
-          typeof record.snippet === "string" ? record.snippet : "",
-        ),
-      };
-    })
-    .filter((result): result is WebSearchResult => result !== undefined);
-}
-
-async function searchDuckDuckGo(
-  query: string,
-): Promise<readonly WebSearchResult[]> {
-  const results: WebSearchResult[] = [];
-  const seenUrls = new Set<string>();
-
-  try {
-    const { body } = await fetchWithTimeout(
-      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
-    );
-    const data: unknown = JSON.parse(body);
-    if (typeof data === "object" && data !== null) {
-      const rec = data as {
-        Heading?: unknown;
-        AbstractText?: unknown;
-        AbstractURL?: unknown;
-        RelatedTopics?: unknown;
-      };
-      const heading = typeof rec.Heading === "string" ? rec.Heading : "";
-      const abstractText =
-        typeof rec.AbstractText === "string" ? rec.AbstractText : "";
-      const abstractUrl =
-        typeof rec.AbstractURL === "string" ? rec.AbstractURL : "";
-      if (abstractText && abstractUrl && !seenUrls.has(abstractUrl)) {
-        seenUrls.add(abstractUrl);
-        results.push({
-          title: heading || query,
-          url: abstractUrl,
-          description: abstractText,
-        });
-      }
-
-      if (Array.isArray(rec.RelatedTopics)) {
-        for (const topic of rec.RelatedTopics) {
-          const t = topic as { Text?: unknown; FirstURL?: unknown };
-          const text = typeof t.Text === "string" ? t.Text : "";
-          const firstUrl = typeof t.FirstURL === "string" ? t.FirstURL : "";
-          if (text && firstUrl && !seenUrls.has(firstUrl)) {
-            seenUrls.add(firstUrl);
-            results.push({
-              title: text.split(" - ")[0] || text.slice(0, 60),
-              url: firstUrl,
-              description: text,
-            });
-          }
-        }
-      }
-    }
-  } catch {
-    // Continue to HTML search
-  }
-
-  try {
-    const { body } = await fetchWithTimeout(
-      `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-    );
-
-    const generalResultRegex =
-      /<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
-
-    let match: RegExpExecArray | null;
-    while ((match = generalResultRegex.exec(body)) !== null) {
-      let rawHref = match[1] || "";
-      const rawTitle = stripHtml(match[2] || "");
-      const rawSnippet = stripHtml(match[3] || "");
-
-      if (rawHref.includes("uddg=")) {
-        const uddgMatch = /uddg=([^&]+)/.exec(rawHref);
-        if (uddgMatch?.[1]) {
-          rawHref = decodeURIComponent(uddgMatch[1]);
-        }
-      }
-      if (rawHref.startsWith("//")) {
-        rawHref = `https:${rawHref}`;
-      }
-
-      if (rawHref && /^https?:\/\//i.test(rawHref) && !seenUrls.has(rawHref)) {
-        seenUrls.add(rawHref);
-        results.push({
-          title: rawTitle || query,
-          url: rawHref,
-          description: rawSnippet,
-        });
-      }
-      if (results.length >= 8) {
-        break;
-      }
-    }
-  } catch {
-    // Continue with existing results
-  }
-
-  return results;
-}
-
-async function searchWebSource(
-  query: string,
-  source: string,
-): Promise<readonly WebSearchResult[]> {
-  const normSource = source.toLowerCase().trim();
-  switch (normSource) {
-    case "stackoverflow":
-      return searchStackOverflow(query);
-    case "mdn":
-      return searchMdn(query);
-    case "hackernews":
-      return searchHackerNews(query);
-    case "github":
-      return searchGitHubRepos(query);
-    case "crates":
-      return lookupCrate(query);
-    case "rubygems":
-      return lookupRubyGem(query);
-    case "go":
-      return lookupGoModule(query);
-    case "registry":
-      return lookupPackage(query);
-    case "wikipedia": {
-      const wikiResults = await searchWikipedia(query);
-      if (wikiResults.length > 0) {
-        return wikiResults;
-      }
-      return searchDuckDuckGo(query);
-    }
-    case "google":
-    case "web":
-    case "duckduckgo":
-    default: {
-      const webResults = await searchDuckDuckGo(query);
-      if (webResults.length > 0) {
-        return webResults;
-      }
-      return searchWikipedia(query);
-    }
-  }
-}
-
-async function searchStackOverflow(
-  query: string,
-): Promise<readonly WebSearchResult[]> {
-  const { body } = await fetchWithTimeout(
-    "https://api.stackexchange.com/2.3/search/advanced" +
-    `?order=desc&sort=relevance&pagesize=5&site=stackoverflow&q=${encodeURIComponent(query)}`,
-  );
-  const data: unknown = JSON.parse(body);
-  const items = (data as { items?: unknown }).items;
-  if (!Array.isArray(items)) {
-    return [];
-  }
-  return items
-    .map((item): WebSearchResult | undefined => {
-      const record = item as {
-        title?: unknown;
-        link?: unknown;
-        score?: unknown;
-        answer_count?: unknown;
-      };
-      const title = typeof record.title === "string" ? record.title : "";
-      const link = typeof record.link === "string" ? record.link : "";
-      if (!title || !link) {
-        return undefined;
-      }
-      return {
-        title,
-        url: link,
-        description: `Score ${typeof record.score === "number" ? record.score : 0}, ${typeof record.answer_count === "number" ? record.answer_count : 0} answers. Stack Overflow question.`,
-      };
-    })
-    .filter((result): result is WebSearchResult => result !== undefined);
-}
-
-async function searchMdn(query: string): Promise<readonly WebSearchResult[]> {
-  const { body } = await fetchWithTimeout(
-    `https://developer.mozilla.org/api/v1/search?q=${encodeURIComponent(query)}&locale=en-US`,
-  );
-  const data: unknown = JSON.parse(body);
-  const documents = (data as { documents?: unknown }).documents;
-  if (!Array.isArray(documents)) {
-    return [];
-  }
-  return documents
-    .map((document): WebSearchResult | undefined => {
-      const record = document as {
-        title?: unknown;
-        summary?: unknown;
-        mdn_url?: unknown;
-      };
-      const title = typeof record.title === "string" ? record.title : "";
-      const mdnUrl = typeof record.mdn_url === "string" ? record.mdn_url : "";
-      if (!title || !mdnUrl) {
-        return undefined;
-      }
-      return {
-        title,
-        url: `https://developer.mozilla.org${mdnUrl}`,
-        description: typeof record.summary === "string" ? record.summary : "",
-      };
-    })
-    .filter((result): result is WebSearchResult => result !== undefined);
-}
-
-async function searchHackerNews(
-  query: string,
-): Promise<readonly WebSearchResult[]> {
-  const { body } = await fetchWithTimeout(
-    `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(query)}&tags=story&hitsPerPage=5`,
-  );
-  const data: unknown = JSON.parse(body);
-  const hits = (data as { hits?: unknown }).hits;
-  if (!Array.isArray(hits)) {
-    return [];
-  }
-  return hits
-    .map((hit): WebSearchResult | undefined => {
-      const record = hit as {
-        title?: unknown;
-        url?: unknown;
-        objectID?: unknown;
-        points?: unknown;
-        num_comments?: unknown;
-      };
-      const title = typeof record.title === "string" ? record.title : "";
-      const objectID =
-        typeof record.objectID === "string" ? record.objectID : "";
-      if (!title || !objectID) {
-        return undefined;
-      }
-      return {
-        title,
-        url:
-          typeof record.url === "string" && record.url
-            ? record.url
-            : `https://news.ycombinator.com/item?id=${objectID}`,
-        description: `${typeof record.points === "number" ? record.points : 0} points, ${typeof record.num_comments === "number" ? record.num_comments : 0} comments. Hacker News discussion.`,
-      };
-    })
-    .filter((result): result is WebSearchResult => result !== undefined);
-}
-
-async function searchGitHubRepos(
-  query: string,
-): Promise<readonly WebSearchResult[]> {
-  const trimmed = query.trim();
-  const variations = new Set<string>([trimmed]);
-  if (trimmed.includes(" ")) {
-    variations.add(trimmed.replace(/\s+/g, ""));
-    variations.add(trimmed.replace(/\s+/g, "-"));
-    variations.add(trimmed.replace(/\s+/g, "_"));
-  }
-
-  const results: WebSearchResult[] = [];
-  const seenUrls = new Set<string>();
-
-  for (const variant of variations) {
-    try {
-      const [usersRes, reposRes] = await Promise.allSettled([
-        fetchWithTimeout(
-          `https://api.github.com/search/users?q=${encodeURIComponent(variant)}&per_page=5`,
-        ),
-        fetchWithTimeout(
-          `https://api.github.com/search/repositories?q=${encodeURIComponent(variant)}&per_page=5`,
-        ),
-      ]);
-
-      if (usersRes.status === "fulfilled") {
-        try {
-          const data: unknown = JSON.parse(usersRes.value.body);
-          const users = (data as { items?: unknown }).items;
-          if (Array.isArray(users)) {
-            for (const item of users) {
-              const u = item as {
-                login?: unknown;
-                html_url?: unknown;
-                type?: unknown;
-              };
-              const login = typeof u.login === "string" ? u.login : "";
-              const htmlUrl = typeof u.html_url === "string" ? u.html_url : "";
-              if (htmlUrl && !seenUrls.has(htmlUrl)) {
-                seenUrls.add(htmlUrl);
-                results.push({
-                  title: `GitHub User: @${login}`,
-                  url: htmlUrl,
-                  description: `GitHub ${typeof u.type === "string" ? u.type : "User"} profile for @${login}. Profile URL: ${htmlUrl}`,
-                });
-              }
-            }
-          }
-        } catch {
-          // ignore parse error
-        }
-      }
-
-      if (reposRes.status === "fulfilled") {
-        try {
-          const data: unknown = JSON.parse(reposRes.value.body);
-          const items = (data as { items?: unknown }).items;
-          if (Array.isArray(items)) {
-            for (const item of items) {
-              const record = item as {
-                full_name?: unknown;
-                html_url?: unknown;
-                description?: unknown;
-                stargazers_count?: unknown;
-                language?: unknown;
-                license?: { spdx_id?: unknown } | null;
-              };
-              const fullName =
-                typeof record.full_name === "string" ? record.full_name : "";
-              const htmlUrl =
-                typeof record.html_url === "string" ? record.html_url : "";
-              if (fullName && htmlUrl && !seenUrls.has(htmlUrl)) {
-                seenUrls.add(htmlUrl);
-                const license =
-                  record.license && typeof record.license.spdx_id === "string"
-                    ? record.license.spdx_id
-                    : "no license";
-                const description =
-                  typeof record.description === "string"
-                    ? record.description
-                    : "";
-                results.push({
-                  title: fullName,
-                  url: htmlUrl,
-                  description:
-                    `${typeof record.stargazers_count === "number" ? record.stargazers_count : 0} stars, ${typeof record.language === "string" ? record.language : "unknown"} language, ${license}. ${description}`.trim(),
-                });
-              }
-            }
-          }
-        } catch {
-          // ignore parse error
-        }
-      }
-
-      if (results.length >= 5) {
-        break;
-      }
-    } catch {
-      // Continue to next variation
-    }
-  }
-
-  return results.slice(0, 10);
-}
-
-const NODE_RELEASES_URL = "https://nodejs.org/dist/index.json";
-
-async function lookupPackage(
-  name: string,
-): Promise<readonly WebSearchResult[]> {
-  const normalized = name.trim().toLowerCase();
-  if (
-    normalized === "node" ||
-    normalized === "node.js" ||
-    normalized === "nodejs"
-  ) {
-    try {
-      const { body } = await fetchWithTimeout(NODE_RELEASES_URL);
-      const releases: unknown = JSON.parse(body);
-      if (!Array.isArray(releases) || releases.length === 0) {
-        return [];
-      }
-      const latest = releases[0] as { version?: unknown } | undefined;
-      const lts = releases.find(
-        (release) => (release as { lts?: boolean | string }).lts !== false,
-      ) as { version?: unknown } | undefined;
-      const versionOf = (release: { version?: unknown } | undefined): string =>
-        typeof release?.version === "string" ? release.version : "";
-      return [
-        {
-          title: `Node.js latest version: ${versionOf(latest)}`,
-          url: "https://nodejs.org/en",
-          description: `Current (latest): ${versionOf(latest)}; latest LTS: ${versionOf(lts)}. Official Node.js releases.`,
-        },
-      ];
-    } catch {
-      return [];
-    }
-  }
-
-  try {
-    const { body } = await fetchWithTimeout(
-      `https://registry.npmjs.org/${encodeURIComponent(normalized)}`,
-    );
-    const data: unknown = JSON.parse(body);
-    const latest = (data as { "dist-tags"?: { latest?: unknown } })[
-      "dist-tags"
-    ]?.latest;
-    if (typeof latest === "string") {
-      return [
-        {
-          title: `npm: ${normalized}@${latest}`,
-          url: `https://www.npmjs.com/package/${encodeURIComponent(normalized)}`,
-          description: `Latest version of the npm package '${normalized}' is ${latest}.`,
-        },
-      ];
-    }
-  } catch {
-    // Try PyPI below.
-  }
-
-  try {
-    const { body } = await fetchWithTimeout(
-      `https://pypi.org/pypi/${encodeURIComponent(normalized)}/json`,
-    );
-    const data: unknown = JSON.parse(body);
-    const version = (data as { info?: { version?: unknown } }).info?.version;
-    if (typeof version === "string") {
-      return [
-        {
-          title: `PyPI: ${normalized} ${version}`,
-          url: `https://pypi.org/project/${encodeURIComponent(normalized)}/`,
-          description: `Latest version of the Python package '${normalized}' is ${version}.`,
-        },
-      ];
-    }
-  } catch {
-    return [];
-  }
-
-  return [];
-}
-
-async function lookupCrate(name: string): Promise<readonly WebSearchResult[]> {
-  try {
-    const { body } = await fetchWithTimeout(
-      `https://crates.io/api/v1/crates/${encodeURIComponent(name.toLowerCase())}`,
-    );
-    const data: unknown = JSON.parse(body);
-    const crate = (
-      data as {
-        crate?: {
-          max_stable_version?: unknown;
-          newest_version?: unknown;
-          description?: unknown;
-        };
-      }
-    ).crate;
-    const version =
-      typeof crate?.max_stable_version === "string" &&
-        crate.max_stable_version.length > 0
-        ? crate.max_stable_version
-        : typeof crate?.newest_version === "string"
-          ? crate.newest_version
-          : "";
-    if (!version) {
-      return [];
-    }
-    return [
-      {
-        title: `crates.io: ${name.toLowerCase()} ${version}`,
-        url: `https://crates.io/crates/${encodeURIComponent(name.toLowerCase())}`,
-        description:
-          typeof crate?.description === "string"
-            ? crate.description
-            : `Latest version of the Rust crate '${name.toLowerCase()}' is ${version}.`,
-      },
-    ];
-  } catch {
-    return [];
-  }
-}
-
-async function lookupRubyGem(
-  name: string,
-): Promise<readonly WebSearchResult[]> {
-  try {
-    const { body } = await fetchWithTimeout(
-      `https://rubygems.org/api/v1/gems/${encodeURIComponent(name)}.json`,
-    );
-    const data: unknown = JSON.parse(body);
-    const record = data as {
-      name?: unknown;
-      version?: unknown;
-      info?: unknown;
-    };
-    const gemName = typeof record.name === "string" ? record.name : name;
-    const version = typeof record.version === "string" ? record.version : "";
-    if (!version) {
-      return [];
-    }
-    return [
-      {
-        title: `RubyGems: ${gemName} ${version}`,
-        url: `https://rubygems.org/gems/${encodeURIComponent(gemName)}`,
-        description:
-          typeof record.info === "string"
-            ? record.info
-            : `Latest version of the Ruby gem '${gemName}' is ${version}.`,
-      },
-    ];
-  } catch {
-    return [];
-  }
-}
-
-function escapeGoModule(modulePath: string): string {
-  return modulePath
-    .split("/")
-    .map((segment) =>
-      segment.replace(/[A-Z!]/g, (character) =>
-        character === "!" ? "!!" : `!${character.toLowerCase()}`,
-      ),
-    )
-    .join("/");
-}
-
-async function lookupGoModule(
-  modulePath: string,
-): Promise<readonly WebSearchResult[]> {
-  try {
-    const escaped = escapeGoModule(modulePath.trim());
-    const { body } = await fetchWithTimeout(
-      `https://proxy.golang.org/${escaped}/@latest`,
-    );
-    const data: unknown = JSON.parse(body);
-    const version = (data as { Version?: unknown }).Version;
-    if (typeof version !== "string") {
-      return [];
-    }
-    return [
-      {
-        title: `Go module: ${modulePath.trim()} ${version}`,
-        url: `https://pkg.go.dev/${modulePath.trim()}`,
-        description: `Latest version of the Go module '${modulePath.trim()}' is ${version}.`,
-      },
-    ];
-  } catch {
-    return [];
-  }
 }
 
 export function activate(context: vscode.ExtensionContext): void {

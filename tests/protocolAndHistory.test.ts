@@ -8,6 +8,7 @@ import {
   createToolResponsePayload,
   isLiveFunctionResponse
 } from "../src/liveProtocol.ts";
+import { createLiveSetupMessage } from "../src/liveConfig.ts";
 import {
   buildConversationHistoryPrompt,
   buildSystemInstruction
@@ -207,4 +208,42 @@ void test("LiveSession preferences support model switching and thinking level", 
   };
   assert.equal(extendedPrefs.liveModel, "gemini-3.8-live-extended-thinking");
   assert.equal(extendedPrefs.thinkingLevel, "high");
+});
+
+void test("instructs model to use Google Vision analysis and OCR for image attachments", () => {
+  const instruction = buildSystemInstruction({
+    voice: "Kore",
+    preferredLanguage: "English",
+    autoInterrupt: true,
+    behavior: "professional"
+  });
+
+  assert.match(instruction, /Google Vision analysis and OCR/u);
+  assert.doesNotMatch(instruction, /Do not claim OCR/u);
+});
+
+void test("createLiveSetupMessage preserves the configured voice preference for all tasks", () => {
+  for (const voice of ["Puck", "Fenrir", "Aoede", "Zephyr", "Charon"] as const) {
+    const setup = createLiveSetupMessage({
+      voice,
+      preferredLanguage: "English",
+      autoInterrupt: true,
+      behavior: "professional"
+    }).setup;
+
+    const generationConfig = setup.generationConfig as {
+      speechConfig?: {
+        voiceConfig?: {
+          prebuiltVoiceConfig?: {
+            voiceName?: string;
+          };
+        };
+      };
+    };
+
+    assert.equal(
+      generationConfig.speechConfig?.voiceConfig?.prebuiltVoiceConfig?.voiceName,
+      voice
+    );
+  }
 });

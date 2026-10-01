@@ -1,14 +1,15 @@
 import WebSocket, { type RawData } from "ws";
 import {
   createToolResponsePayload,
+  LiveToolCalls,
+  type LiveFunctionCall,
   type LiveFunctionResponse
 } from "./liveProtocol.js";
-import { buildSystemInstruction } from "./prompts.js";
-import type { ImageContext, Preferences } from "./types.js";
+import { createLiveSetupMessage } from "./liveConfig.js";
+import type { Preferences } from "./types.js";
 
 export type { LiveFunctionResponse } from "./liveProtocol.js";
 
-const MODEL = "gemini-3.8-live";
 const LIVE_API_ENDPOINT =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
@@ -36,14 +37,19 @@ export class LiveSession {
   private setupComplete = false;
   private goAwayReceived = false;
   private readonly pendingMessages: unknown[] = [];
+  private readonly toolCalls = new LiveToolCalls();
+  private setupTimer: ReturnType<typeof setTimeout> | undefined;
 
   public constructor(
-    private readonly onEvent: (event: LiveSessionEvent) => void
+    private readonly onEvent: (event: LiveSessionEvent) => void,
+    private readonly options: { endpoint?: string; setupTimeoutMs?: number } = {}
   ) { }
 
   public get isConnected(): boolean {
-    return this.socket?.readyState === WebSocket.OPEN;
+    return this.socket?.readyState === WebSocket.OPEN && this.setupComplete && !this.goAwayReceived;
   }
+
+  public isToolCallPending(id: string): boolean { return this.toolCalls.has(id); }
 
   public connect(apiKey: string, preferences: Preferences): void {
     if (
@@ -58,18 +64,24 @@ export class LiveSession {
     this.setupComplete = false;
     this.goAwayReceived = false;
     this.pendingMessages.length = 0;
+    this.toolCalls.reset();
     this.onEvent({ type: "connecting" });
 
-    const endpoint = `${LIVE_API_ENDPOINT}?key=${encodeURIComponent(apiKey)}`;
+    const endpoint = `${this.options.endpoint ?? LIVE_API_ENDPOINT}?key=${encodeURIComponent(apiKey)}`;
     const socket = new WebSocket(endpoint);
     this.socket = socket;
+    this.setupTimer = setTimeout(() => {
+      if (this.socket !== socket || this.setupComplete) return;
+      this.onEvent({ type: "error", message: "Gemini did not finish connecting. Check your network, API key, and selected model, then retry." });
+      socket.terminate();
+    }, this.options.setupTimeoutMs ?? 20_000);
 
     socket.on("open", () => {
       if (this.socket !== socket) {
         return;
       }
 
-      socket.send(JSON.stringify(this.createSetupMessage(preferences)));
+      socket.send(JSON.stringify(createLiveSetupMessage(preferences)));
       this.onEvent({ type: "opened" });
     });
 
@@ -87,8 +99,7 @@ export class LiveSession {
         } else {
           jsonText = data.toString("utf8");
         }
-        const payload: unknown = JSON.parse(jsonText);
-        this.handleServerPayload(payload);
+        const payload = this.handleServerPayload(JSON.parse(jsonText) as unknown);
         this.onEvent({ type: "serverMessage", payload });
       } catch {
         this.onEvent({
@@ -110,6 +121,8 @@ export class LiveSession {
       }
 
       this.socket = undefined;
+      clearTimeout(this.setupTimer);
+      this.toolCalls.reset();
       this.setupComplete = false;
       this.goAwayReceived = false;
       this.pendingMessages.length = 0;
@@ -158,56 +171,27 @@ export class LiveSession {
     return this.send({ realtimeInput: { text } });
   }
 
-  /** Interrupt the current model turn by sending an empty realtime input. */
-  public sendInterrupt(): boolean {
-    return this.send({ realtimeInput: {} });
+  public sendAudioStreamEnd(): boolean {
+    return this.send({ realtimeInput: { audioStreamEnd: true } });
   }
 
-  public sendUserTurn(
-    text: string,
-    images: readonly ImageContext[] = []
-  ): boolean {
-    if (images.length > 0) {
-      for (const image of images) {
-        this.send({
-          realtimeInput: {
-            video: {
-              data: image.data,
-              mimeType: image.mimeType.startsWith("image/")
-                ? image.mimeType
-                : "image/jpeg"
-            }
-          }
-        });
-      }
+  /** A completed client turn interrupts generation; empty realtimeInput does not. */
+  public sendInterrupt(): boolean {
+    this.toolCalls.cancel();
+    this.pendingMessages.length = 0;
+    return this.send({ clientContent: { turns: [], turnComplete: true } });
+  }
 
-      const parts: unknown[] = images.map((image) => ({
-        inlineData: {
-          data: image.data,
-          mimeType: image.mimeType
-        }
-      }));
-      parts.push({ text });
-      this.send({
-        clientContent: {
-          turns: [
-            {
-              role: "user",
-              parts
-            }
-          ],
-          turnComplete: true
-        }
-      });
-    }
-
+  public sendUserTurn(text: string): boolean {
     return this.send({ realtimeInput: { text } });
   }
 
   public sendToolResponses(
     functionResponses: readonly LiveFunctionResponse[]
   ): boolean {
-    return this.send(createToolResponsePayload(functionResponses));
+    const pending = this.toolCalls.complete(functionResponses);
+    // Late responses to cancelled calls are deliberately ignored.
+    return pending.length === 0 || this.send(createToolResponsePayload(pending));
   }
 
   public disconnect(): void {
@@ -215,6 +199,9 @@ export class LiveSession {
     this.intentionalClose = true;
     this.socket = undefined;
     this.pendingMessages.length = 0;
+    this.setupComplete = false;
+    clearTimeout(this.setupTimer);
+    this.toolCalls.reset();
 
     if (
       socket &&
@@ -250,16 +237,18 @@ export class LiveSession {
       // the server acknowledges setup, then flush them in order.
       if (this.pendingMessages.length < MAX_PENDING_MESSAGES) {
         this.pendingMessages.push(payload);
+        return true;
       }
-      return true;
+      return false;
     }
 
     return this.sendNow(payload);
   }
 
   private sendNow(payload: unknown): boolean {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
     try {
-      this.socket?.send(JSON.stringify(payload), (error) => {
+      this.socket.send(JSON.stringify(payload), (error) => {
         if (error) {
           this.onEvent({
             type: "error",
@@ -280,9 +269,9 @@ export class LiveSession {
     }
   }
 
-  private handleServerPayload(payload: unknown): void {
+  private handleServerPayload(payload: unknown): unknown {
     if (typeof payload !== "object" || payload === null) {
-      return;
+      return payload;
     }
 
     const message = payload as Readonly<Record<string, unknown>>;
@@ -292,13 +281,23 @@ export class LiveSession {
       // earlier makes the server abort the connection with code 1008
       // ("The operation was aborted.").
       this.setupComplete = true;
+      clearTimeout(this.setupTimer);
       this.flushPendingMessages();
-      return;
+      return payload;
     }
 
     if (message.goAway !== undefined) {
       this.handleGoAway();
     }
+    const cancellation = message.toolCallCancellation as { ids?: readonly string[] } | undefined;
+    if (cancellation?.ids) this.toolCalls.cancel(cancellation.ids);
+    const content = message.serverContent as { interrupted?: boolean } | undefined;
+    if (content?.interrupted) this.toolCalls.cancel();
+    const calls = (message.toolCall as { functionCalls?: readonly LiveFunctionCall[] } | undefined)?.functionCalls;
+    if (Array.isArray(calls)) {
+      return { ...message, toolCall: { functionCalls: this.toolCalls.accept(calls) } };
+    }
+    return payload;
   }
 
   private handleGoAway(): void {
@@ -335,145 +334,4 @@ export class LiveSession {
     return Boolean(realtime?.audio);
   }
 
-  private createSetupMessage(preferences: Preferences): unknown {
-    const selectedModel = preferences.liveModel || MODEL;
-    const isExtendedThinking =
-      selectedModel === "gemini-3.8-live-extended-thinking";
-
-    const generationConfig: Record<string, unknown> = {
-      responseModalities: ["AUDIO"],
-      temperature: 0.3,
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: {
-            voiceName: preferences.voice
-          }
-        }
-      }
-    };
-
-    if (isExtendedThinking) {
-      const level = (preferences.thinkingLevel ?? "high").toUpperCase();
-      generationConfig.thinkingConfig = {
-        thinkingLevel:
-          level === "MINIMAL" ||
-          level === "LOW" ||
-          level === "MEDIUM" ||
-          level === "HIGH"
-            ? level
-            : "HIGH"
-      };
-    }
-
-    return {
-      setup: {
-        model: `models/${selectedModel}`,
-        generationConfig,
-        systemInstruction: {
-          parts: [{ text: buildSystemInstruction(preferences) }]
-        },
-        tools: [
-          {
-            functionDeclarations: [
-              {
-                name: "search_workspace",
-                description:
-                  "Search the currently open VS Code workspace for files, symbols, definitions, imports, routes, components, and usages. Use this whenever the supplied context does not contain enough code to answer. The result contains real code snippets and paths.",
-                parameters: {
-                  type: "OBJECT",
-                  properties: {
-                    query: {
-                      type: "STRING",
-                      description:
-                        "A precise filename, symbol, import path, or code-search query."
-                    }
-                  },
-                  required: ["query"]
-                }
-              },
-              {
-                name: "read_workspace_file",
-                description:
-                  "Read a specific workspace file returned by search_workspace. Call this after finding a path when you need more code. Large files can be read in line ranges.",
-                parameters: {
-                  type: "OBJECT",
-                  properties: {
-                    file_path: {
-                      type: "STRING",
-                      description:
-                        "Workspace-relative file path, such as src/components/TemplateBuilder.jsx."
-                    },
-                    start_line: {
-                      type: "INTEGER",
-                      description:
-                        "Optional 1-based first line. Defaults to line 1."
-                    },
-                    end_line: {
-                      type: "INTEGER",
-                      description:
-                        "Optional 1-based last line. Defaults to a bounded section."
-                    }
-                  },
-                  required: ["file_path"]
-                }
-              },
-              {
-                name: "fetch_url",
-                description:
-                  "Fetch a web page (GitHub repository, README, article, documentation page, blog post, etc.) shared by the user and return its readable text content. Use this whenever the user shares a link or asks for details about a specific URL. The result contains the page title and extracted text.",
-                parameters: {
-                  type: "OBJECT",
-                  properties: {
-                    url: {
-                      type: "STRING",
-                      description:
-                        "The absolute http(s) URL to fetch."
-                    }
-                  },
-                  required: ["url"]
-                }
-              },
-              {
-                name: "search_web",
-                description:
-                  "Search the web or a specific source for a topic and return matching titles and URLs. Choose the source that best fits the question: web (default general search for apps, websites, companies, tools, and documentation); github for GitHub users, profiles, repositories, and projects; registry for the latest version of Node.js, npm packages, or Python packages; stackoverflow for programming questions and errors; mdn for web platform documentation; hackernews for tech news and discussions; wikipedia for general technical concepts; crates for Rust crates; rubygems for Ruby gems; and go for Go modules. Try intelligent query variations when searching. After results return, call fetch_url on the most relevant URL to read the full content.",
-                parameters: {
-                  type: "OBJECT",
-                  properties: {
-                    query: {
-                      type: "STRING",
-                      description:
-                        "A concise search phrase, app name, package name, username, or topic."
-                    },
-                    source: {
-                      type: "STRING",
-                      description:
-                        "The source to search: web (general web search), github, registry, stackoverflow, mdn, hackernews, wikipedia, crates, rubygems, or go. Defaults to web."
-                    }
-                  },
-                  required: ["query"]
-                }
-              },
-              {
-                name: "render_markdown",
-                description:
-                  "Render code, Markdown tables, lists, headings, and detailed visual technical content in the chat panel. REQUIRED whenever providing code snippets, examples, programming solutions, JSON, tables, or structured explanations. You must call this tool with complete, runnable code in fenced code blocks whenever answering programming or implementation questions.",
-                parameters: {
-                  type: "OBJECT",
-                  properties: {
-                    markdown: {
-                      type: "STRING",
-                      description:
-                        "The complete Markdown content including fenced code blocks (e.g. ```python), headings, explanations, or JSON to display in the chat panel."
-                    }
-                  },
-                  required: ["markdown"]
-                }
-              }
-            ]
-          }
-        ]
-      }
-    };
-  }
 }

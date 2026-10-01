@@ -113,6 +113,10 @@ export class TranscribeLiveSession {
     });
   }
 
+  public sendAudioStreamEnd(): boolean {
+    return this.send({ realtimeInput: { audioStreamEnd: true } });
+  }
+
   public disconnect(): void {
     const socket = this.socket;
     this.socket = undefined;

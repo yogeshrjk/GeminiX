@@ -2,7 +2,7 @@
   "name": "gemini-x",
   "displayName": "GeminiX",
   "description": "Explore and explain selected code with Gemini Live inside VS Code.",
-  "version": "0.6.7",
+  "version": "0.6.8",
   "icon": "media/gemini-x.png",
   "publisher": "YogeshRajak",
   "license": "MIT",
@@ -44,9 +44,10 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "check": "tsc --noEmit && eslint .",
-    "package": "npm run check && npm run build && vsce package --out gemini-x-v0.6.7.vsix",
+    "package": "npm run check && npm test && npm run build && vsce package --out gemini-x-v0.6.8.vsix",
     "test": "node --import tsx --test tests/*.test.ts",
-    "vscode:prepublish": "npm run build"
+    "vscode:prepublish": "npm run build",
+    "test:ui": "npm run build && node --test tests/webview.integration.mjs"
   },
   "contributes": {
     "commands": [
@@ -214,7 +215,7 @@
           "enumDescriptions": [
             "Gemini 3.8 Live (Default)",
             "Gemini 3.1 Flash Live",
-            "Gemini 3.8 Live Extended Thinking (Not working properly, recommended using 3.8 Live)"
+            "Gemini 3.8 Live Extended Thinking (asynchronous reasoning and tools)"
           ],
           "description": "Live model used for bidirectional streaming voice conversations."
         },
@@ -248,6 +249,7 @@
     "@vscode/vsce": "^3.6.0",
     "esbuild": "^0.25.8",
     "eslint": "^9.32.0",
+    "playwright": "1.62.1",
     "shiki": "^4.3.1",
     "tsx": "^4.20.3",
     "typescript": "^5.9.2",
